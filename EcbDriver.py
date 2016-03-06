@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import mraa
 from threading import Timer
@@ -42,18 +42,18 @@ class Controller(mraa.I2c):
 
 class HbController(Controller):
     REGS = {
-        'led_row_0': 0,
-        'led_row_1': 1,
-        'led_row_2': 2,
-        'led_row_3': 3,
+        'led_row_0':    0,
+        'led_row_1':    1,
+        'led_row_2':    2,
+        'led_row_3':    3,
         'sensor_row_0': 4,
         'sensor_row_1': 5,
         'sensor_row_2': 6,
         'sensor_row_3': 7,
-        'clock_min': 8,
-        'clock_sec': 9,
-        'command': 10,
-        'status': 11
+        'clock_min':    8,
+        'clock_sec':    9,
+        'command':      10,
+        'status':       11
     }
 
     CMD_CLOCK_START = 1 << 0
@@ -156,6 +156,13 @@ class EcbDriver(object):
     CLOCK_BOTTOM = 0
     CLOCK_TOP = 1
 
+    # command panel button IDs
+    CMD_BTN_MODE = 1 << 0
+    CMD_BTN_OPP_LEVEL = 1 << 1
+    CMD_BTN_OPP_COLOR = 1 << 2
+    CMD_BTN_GAME_TIME = 1 << 3
+    CMD_BTN_GAME_START = 1 << 4
+
     # command panel led IDs
     CMD_LED_START = 1 << 0
     CMD_LED_OPP_COLOR = 1 << 1
@@ -166,10 +173,10 @@ class EcbDriver(object):
     CMD_LED_WIFI_ON = 1 << 6
     CMD_LED_BT_ON = 1 << 7
 
-    def __init__(self, sensors_changed_cb, clock_expired_cb, btn_pressed_cb):
-        self.sensors_changed_cb = sensors_changed_cb
-        self.clock_expired_cb = clock_expired_cb
-        self.btn_pressed_cb = btn_pressed_cb
+    def __init__(self):
+        self.sensors_changed_cb = None
+        self.clock_expired_cb = None
+        self.btn_pressed_cb = None
 
         self.led_map = [0, 0, 0, 0, 0, 0, 0, 0]
         self.sensor_map = [0, 0, 0, 0, 0, 0, 0, 0]
@@ -219,22 +226,26 @@ class EcbDriver(object):
             changed_sensor_map[row] = old_sensor_map[row] ^ buf[row]
             self.sensor_map[row + row_offs] = buf[row]
 
-        self.sensors_changed_cb(rows_to_squares(changed_sensor_map, ctrl))
+        if self.sensors_changed_cb is not None:
+            self.sensors_changed_cb(rows_to_squares(changed_sensor_map, ctrl))
 
     def _top_int_cb(self, sensors_changed, clock_expired):
         if clock_expired:
-            self.clock_expired_cb(self.CLOCK_TOP)
+            if self.clock_expired_cb is not None:
+                self.clock_expired_cb(self.CLOCK_TOP)
         else:
             self._handle_sensor_changes(self.top)
 
     def _bot_int_cb(self, sensors_changed, clock_expired):
         if clock_expired:
-            self.clock_expired_cb(self.CLOCK_BOTTOM)
+            if self.clock_expired_cb is not None:
+                self.clock_expired_cb(self.CLOCK_BOTTOM)
         else:
             self._handle_sensor_changes(self.bot)
 
     def _cmd_int_cb(self, btns):
-        self.btn_pressed_cb(btns)
+        if self.btns_pressed_cb is not None:
+            self.btns_pressed_cb(btns)
 
     def _squares_to_map(self, squares_list):
         rows_map = [0, 0, 0, 0, 0, 0, 0, 0]
@@ -282,6 +293,12 @@ class EcbDriver(object):
 
         self.blink_state ^= 1
         self._leds_switch(new_map)
+
+    # set callbacks
+    def set_callbacks(self, sensors_changed_cb, clock_expired_cb, btns_pressed_cb):
+        self.sensors_changed_cb = sensors_changed_cb
+        self.clock_expired_cb = clock_expired_cb
+        self.btns_pressed_cb = btns_pressed_cb
 
     # LEDs API
     def leds_on(self, squares_list):
@@ -361,12 +378,12 @@ class EcbDriver(object):
     def clock_start(self, clock_id):
         ctrl = [self.bot, self.top][clock_id]
 
-        ctrl.clock_start()
+        ctrl.clock_switch(1)
 
     def clock_stop(self, clock_id):
         ctrl = [self.bot, self.top][clock_id]
 
-        ctrl.clock_stop()
+        ctrl.clock_switch(0)
 
     def clock_blank(self, clock_id):
         ctrl = [self.bot, self.top][clock_id]
@@ -381,13 +398,32 @@ class EcbDriver(object):
         self.cmd.leds_switch(led_mask, 0)
 
 
-def sensors_changed_cb(sq_list):
-    print("sensors changed cb called: %s" % str(sq_list))
+if __name__ == "__main__":
+    def sensors_changed_cb(sq_list):
+        print("sensors changed cb called: %s" % str(sq_list))
 
+    def clock_expired_cb(clock_id):
+        print("clock expired cb called: %d" % clock_id)
 
-def clock_expired_cb(clock_id):
-    print("clock expired cb called: %d" % clock_id)
+    def btns_pressed_cb(btns):
+        print("buttons pressed called: %d" % btns)
 
-
-def btns_pressed_cb(btns):
-    print("buttons pressed called: %d" % btns)
+    import time
+    driver = EcbDriver()
+    driver.set_callbacks(sensors_changed_cb, clock_expired_cb, btns_pressed_cb)
+    driver.sensors_start()
+    for min, sec in [(90, 0), (80, 0), (70, 0), (60, 0)]:
+        driver.clock_set(driver.CLOCK_BOTTOM, min, sec)
+        driver.clock_set(driver.CLOCK_TOP, min, sec)
+        time.sleep(1)
+    driver.clock_start(driver.CLOCK_BOTTOM)
+    driver.clock_start(driver.CLOCK_TOP)
+    driver.leds_blink(['a2', 'a4'], ['h2', 'h8'])
+    time.sleep(10)
+    driver.leds_blink()
+    driver.clock_stop(driver.CLOCK_BOTTOM)
+    driver.clock_stop(driver.CLOCK_TOP)
+    time.sleep(3)
+    driver.clock_blank(driver.CLOCK_BOTTOM)
+    driver.clock_blank(driver.CLOCK_TOP)
+    driver.sensors_stop()
