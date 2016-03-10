@@ -31,7 +31,8 @@ Event.game_stopped = Event("game stopped")
 Event.move_started = Event("move started")
 Event.move_ended = Event("move ended")
 Event.move_aborted = Event("move aborted")
-Event.engine_moved = Event("engine moved")
+Event.engine_move_started = Event("engine indicated a move")
+Event.engine_move_ended = Event("engine piece was moved")
 
 
 class StateMachine(object):
@@ -46,7 +47,6 @@ class StateMachine(object):
 class Idle(State):
     def run(self, ecb, event, event_data):
         print("idle: " + str(event))
-        pass
 
     def next(self, event):
         if event == Event.game_config:
@@ -132,9 +132,6 @@ class Starting(State):
 
         return unknown_squares
 
-    def _engine_start(self, ecb):
-        ecb.engine = chess.uci.popen_engine(ecb.path_to_engine)
-
     def _attempt_start(self, ecb):
         sensors_map = ecb.driver.sensors_get()
         print(str(sensors_map))
@@ -152,13 +149,16 @@ class Starting(State):
             return
 
         ecb.driver.leds_blink()
-        ecb.driver.clock_start(ecb.board.turn)
 
-        if ecb.game_config.level == GameConfig.LEVEL_DISABLED:
-            print("Play against human")
-            ecb.event_queue.put((Event.game_started, None))
+        if ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+            print("Play against engine. Starting engine...")
+            ecb.engine = chess.uci.popen_engine(ecb.path_to_engine)
+            ecb.engine.uci()
+            ecb.engine.ucinewgame()
         else:
-            self._engine_start(ecb)
+            print("Play against human.")
+
+        ecb.event_queue.put((Event.game_started, None))
 
     def run(self, ecb, event, event_data):
         print("starting: " + str(event))
@@ -193,6 +193,9 @@ class Stopping(State):
             ecb.driver.clock_blank(EcbDriver.CLOCK_BOTTOM)
             ecb.driver.clock_blank(EcbDriver.CLOCK_TOP)
 
+            if ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                ecb.engine.quit()
+
             ecb.event_queue.put((Event.game_stopped, None))
 
     def next(self, event):
@@ -212,12 +215,40 @@ class Game(State):
 
         return legal_moves
 
+    def _engine_go(self, ecb):
+        def engine_on_go_finished(command):
+            ecb.event_queue.put((Event.engine_move_started, command))
+
+        wtime = self.time[chess.WHITE]
+        btime = self.time[chess.BLACK]
+        wtime_msec = (wtime['min'] * 60 + wtime['sec']) * 1000
+        btime_msec = (btime['min'] * 60 + btime['sec']) * 1000
+
+        ecb.engine.position(ecb.board)
+        ecb.engine.go(wtime=wtime_msec, btime=btime_msec,
+                      async_callback=engine_on_go_finished)
+
     def run(self, ecb, event, event_data):
         print("game: " + str(event))
+
+        if event == Event.game_started:
+            self.time = [ecb.game_config.time, ecb.game_config.time]
+
+            if ecb.board.turn == ecb.game_config.opp_color and\
+                    ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                self._engine_go(ecb)
+
+            ecb.driver.clock_start(ecb.board.turn)
+            ecb.driver.btn_led_on(EcbDriver.CMD_LED_START)
 
         if event == Event.sensors_changed:
             if len(event_data) != 1:
                 raise Exception("TODO: More than one piece has changed")
+
+            # ignore events from engine pieces
+            if ecb.board.turn == ecb.game_config.opp_color and \
+                    ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                return
 
             self.from_sq = chess.SQUARE_NAMES.index(event_data[0])
             legal_moves = self._get_legal_moves(ecb.board, event_data[0])
@@ -237,7 +268,12 @@ class Game(State):
             move = chess.Move(from_square=self.from_sq, to_square=to_sq)
 
             ecb.driver.clock_stop(ecb.board.turn)
+            self.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
             ecb.board.push(move)
+            if ecb.board.turn == ecb.game_config.opp_color and \
+                    ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                self._engine_go(ecb)
+
             ecb.driver.clock_start(ecb.board.turn)
 
         if event == Event.game_config:
@@ -252,6 +288,8 @@ class Game(State):
             return Ecb.stopping
         elif event == Event.move_started:
             return Ecb.move
+        elif event == Event.engine_move_started:
+            return Ecb.engine_move
 
         return Ecb.game
 
@@ -296,12 +334,40 @@ class Move(State):
         return Ecb.move
 
 
+class EngineMove(State):
+    def run(self, ecb, event, event_data):
+        if event == Event.engine_move_started:
+            bestmove, ponder = event_data.result()
+            self.from_sq = chess.SQUARE_NAMES[bestmove.from_square]
+            self.to_sq = chess.SQUARE_NAMES[bestmove.to_square]
+
+            ecb.driver.leds_blink([self.from_sq], [self.to_sq])
+            ecb.driver.clock_stop(ecb.board.turn)
+            ecb.board.push(bestmove)
+            ecb.driver.clock_start(ecb.board.turn)
+
+        if event == Event.sensors_changed:
+            if len(event_data) != 1:
+                raise Exception('TODO: handle multiple pieces moved')
+
+            if event_data[0] == self.from_sq:
+                ecb.driver.leds_blink(None, [self.to_sq])
+                self.from_sq = ''
+            elif event_data[0] == self.to_sq and self.from_sq == '':
+                ecb.driver.leds_blink()
+
+                ecb.event_queue.put((Event.engine_move_ended, None))
+
+    def next(self, event):
+        if event == Event.engine_move_ended:
+            return Ecb.game
+
+        return Ecb.engine_move
+
+
 class GameConfig(object):
     MODE_NORMAL = 0
     MODE_LEARN = 1
-
-    COLOR_BLACK = 0
-    COLOR_WHITE = 1
 
     LEVEL_DISABLED = 0
     LEVEL_EASY = 1
@@ -317,9 +383,9 @@ class GameConfig(object):
 
     def __init__(self):
         self.mode = GameConfig.MODE_LEARN
-        self.level = GameConfig.LEVEL_DISABLED
-        self.opp_color = GameConfig.COLOR_WHITE
-        self.time = {'min': 90, 'sec': 0}
+        self.level = GameConfig.LEVEL_EASY
+        self.opp_color = chess.WHITE
+        self.time = {'min': 5, 'sec': 0}
 
     def mode_change(self):
         self.mode ^= 1
@@ -378,7 +444,7 @@ class Ecb(StateMachine):
         self.board = None
 
         self.path_to_engine = path_to_engine
-        self.engine = chess.uci.popen_engine(path_to_engine)
+        self.engine = None
 
         super(Ecb, self).__init__(Ecb.idle)
 
@@ -415,6 +481,7 @@ Ecb.starting = Starting()
 Ecb.stopping = Stopping()
 Ecb.game = Game()
 Ecb.move = Move()
+Ecb.engine_move = EngineMove()
 
 if __name__ == "__main__":
     driver = EcbDriver()

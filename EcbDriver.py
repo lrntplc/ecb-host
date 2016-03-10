@@ -94,7 +94,7 @@ class HbController(Controller):
     def clock_get(self):
         data = self.readBytesReg(self.REGS['clock_min'], 2)
 
-        return (data[0], data[1])
+        return {'min': data[0], 'sec': data[1]}
 
     def clock_switch(self, on):
         reg_change = [self.reg_bit_clear, self.reg_bit_set][on]
@@ -384,7 +384,7 @@ class EcbDriver(object):
     def clock_get(self, clock_id):
         ctrl = [self.bot, self.top][clock_id]
 
-        ctrl.clock_get()
+        return ctrl.clock_get()
 
     def clock_start(self, clock_id):
         ctrl = [self.top, self.bot][clock_id]
