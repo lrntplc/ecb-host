@@ -1,114 +1,99 @@
 #!/usr/bin/env python
 
+from EcbDriver import EcbDriver
 import chess
 import chess.uci
+import Queue
 from threading import Timer
 
 
-class EcbFSM(object):
-    EVENT = {
-        "SENSORS_CHANGED":      0,
-        "CLOCK_EXPIRED":        1,
-        "BUTTON_PRESSED":       2,
-        "HUMAN_STARTED":        3,
-        "HUMAN_STOPPED":        3,
-        "ENGINE_STARTED":       4,
-        "ENGINE_STOPPED":       5,
-        "ENGINE_MOVED":         6,
-    }
-    MODE = {
-        "NORMAL": 0,
-        "LEARN":  1
-    }
-    COLOR = {
-        "BLACK": 0,
-        "WHITE": 1,
-    }
-    LEVEL = {
-        "DISABLED": 0,  # opponent is human
-        "EASY":     1,  #
-        "MEDIUM":   2,  # opponent is Edison
-        "HARD":     3,  #
-    }
+class State(object):
+    def run(self, ecb, event, event_data=None):
+        assert 0, "not implemented"
 
-    LEVEL_LEDS_MAP = [
-        [0, 0, 0],  # LEVEL DISABLED
-        [1, 0, 0],  # LEVEL EASY
-        [0, 1, 0],  # LEVEL MEDIUM
-        [0, 0, 1],  # LEVEL HARD
-    ]
+    def next(self, event):
+        assert 0, "not implemented"
 
-    DEFAULT_CONFIG = {
-        "mode":           MODE["NORMAL"],
-        "level":          LEVEL["EASY"],
-        "engine_color":   COLOR["WHITE"],
-        "time": {
-            "min": 0,
-            "sec": 0
-        }
-    }
 
-    def __init__(self, path_to_engine, ecb_driver):
-        self.path_to_engine = path_to_engine
-        self.current_state = self._state_idle
-        self.driver = ecb_driver
-        self.game_time = {
-            'min': 0,
-            'sec': 0,
-        }
+class Event(object):
+    def __init__(self, event_description):
+        self.event_description = event_description
 
-        self.engine = None
-        self.board = None
+    def __str__(self):
+        return self.event_description
 
-        self.game_config = self.DEFAULT_CONFIG
-        self.game_state = {
-            'wtime': 0,
-            'btime': 0,
-            'current_clock': self.driver.CLOCK_BOTTOM,
-            'current_move': {},
-            'move_turn': self.COLOR['WHITE'],
-            'moves': [],
-        }
+Event.sensors_changed = Event("sensors changed")
+Event.clock_expired = Event("clock expired")
+Event.game_config = Event("one of the config buttons was pressed")
+Event.game_start = Event("start game button was pressed")
+Event.game_started = Event("game started")
+Event.game_stopped = Event("game stopped")
+Event.move_started = Event("move started")
+Event.move_ended = Event("move ended")
+Event.move_aborted = Event("move aborted")
+Event.engine_moved = Event("engine moved")
 
-        self.driver.set_callbacks(self._sensors_callback,
-                                  self._clock_expired_callback,
-                                  self._cmd_callback)
 
-        self.driver.clock_blank(self.driver.CLOCK_BOTTOM)
-        self.driver.clock_blank(self.driver.CLOCK_TOP)
-        self._cmd_panel_leds_update()
+class StateMachine(object):
+    def __init__(self, initial_state):
+        self.current_state = initial_state
 
-    def _sensors_callback(self, changed_squares):
-        print("sensors callback: " + changed_squares)
-        self.current_state({
-            'type': self.EVENT['SENSORS_CHANGED'],
-            'data': changed_squares
-        })
+    def handle(self, ecb, event, event_data):
+        self.current_state = self.current_state.next(event)
+        self.current_state.run(ecb, event, event_data)
 
-    def _clock_expired_callback(self, clock_id):
-        print("clock expired: " + clock_id)
-        self.current_state({
-            'type': self.EVENT['CLOCK_EXPIRED'],
-            'data': clock_id
-        })
 
-    def _cmd_callback(self, buttons_mask):
-        self.current_state({
-            'type': self.EVENT['BUTTON_PRESSED'],
-            'data': buttons_mask,
-        })
+class Idle(State):
+    def run(self, ecb, event, event_data):
+        print("idle: " + str(event))
+        pass
 
-    def _cmd_panel_leds_update(self):
-        mode_cmd = [self.driver.btn_led_off, self.driver.btn_led_on][self.game_config['mode']]
-        level_led_map = self.LEVEL_LEDS_MAP[self.game_config['level']]
-        color_cmd = [self.driver.btn_led_off, self.driver.btn_led_on][self.game_config['engine_color']]
+    def next(self, event):
+        if event == Event.game_config:
+            return Ecb.setup
+        if event == Event.game_start:
+            return Ecb.starting
 
-        mode_cmd(self.driver.CMD_LED_MODE)
-        color_cmd(self.driver.CMD_LED_OPP_COLOR)
+        return Ecb.idle
 
-        for i in range(0, 3):
-            level_cmd = [self.driver.btn_led_off, self.driver.btn_led_on][level_led_map[i]]
-            level_cmd(1 << (i + 2))
+
+class Setup(State):
+    def run(self, ecb, event, event_data):
+        print("setup: " + str(event))
+        if event != Event.game_config:
+            return
+
+        if event_data & EcbDriver.CMD_BTN_MODE:
+            ecb.game_config.mode_change()
+        if event_data & EcbDriver.CMD_BTN_OPP_LEVEL:
+            ecb.game_config.level_change()
+        if event_data & EcbDriver.CMD_BTN_OPP_COLOR:
+            ecb.game_config.opp_color_change()
+        if event_data & EcbDriver.CMD_BTN_GAME_TIME:
+            ecb.game_config.time_change()
+
+        ecb.game_config.update(ecb.driver)
+
+    def next(self, event):
+        if event == Event.game_start:
+            return Ecb.starting
+
+        return Ecb.setup
+
+
+class Starting(State):
+    POSITION_NEW = 0
+    POSITION_CUSTOM = 1
+
+    def _row_to_squares(self, row, val):
+        columns = "abcdefgh"
+        squares = []
+
+        for i in range(0, 8):
+            if (val & (1 << i)):
+                squares.append("%s%d" % (columns[i], row + 1))
+
+        return squares
 
     def _bits_in_byte(self, byte):
         half_byte_map = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]
@@ -118,214 +103,320 @@ class EcbFSM(object):
 
         return low_byte_bits + high_byte_bits
 
-    def _get_chessmen_no(self, sensor_map):
+    def _get_chessmen_no(self, sensors_map):
         chessmen_no = 0
         for row in range(0, 8):
-            chessmen_no += self._bits_in_byte(sensor_map[row])
+            chessmen_no += self._bits_in_byte(sensors_map[row])
 
         return chessmen_no
 
-    def _is_new_game(self, sensor_map):
-        return sensor_map[0] == 0xff and sensor_map[1] == 0xff and\
-            sensor_map[6] == 0xff and sensor_map[7] == 0xff
+    def _detect_position_type(self, sensors_map):
+        chessmen_no = self._get_chessmen_no(sensors_map)
+        print("detected %d chessmen" % chessmen_no)
 
-    def _is_new_game_missing_pieces(self, sensor_map):
-        chessmen_no = self._get_chessmen_no(sensor_map)
+        if chessmen_no > 25 and not sensors_map[2] and not sensors_map[3] and \
+                not sensors_map[4] and not sensors_map[5]:
+            return self.POSITION_NEW
 
-        return chessmen_no > 25 and not sensor_map[2] and not sensor_map[3] and\
-            not sensor_map[4] and not sensor_map[5]
+        return self.POSITION_CUSTOM
 
-    def _get_initial_pos_missing_squares(self, sensor_map):
+    def _new_game_unknown_squares(self, sensors_map):
         initial_pos_rows = [0, 1, 6, 7]
-        missing_squares = []
+        unknown_squares = []
 
         for i in range(0, 4):
             row_pos = initial_pos_rows[i]
-            row_val = ~(sensor_map[initial_pos_rows[i]])
+            row_val = ~(sensors_map[initial_pos_rows[i]])
 
-            missing_squares += self._row_to_squares(row_pos, row_val)
+            unknown_squares += self._row_to_squares(row_pos, row_val)
 
-        return missing_squares
+        return unknown_squares
 
-    def _get_initial_position(self, sensor_map):
-        if self._is_new_game(sensor_map):
-            self.driver._leds_blink()  # stop blinking leds, if any
-            return chess.STARTING_FEN
-        elif self._is_new_game_missing_pieces(sensor_map):
-            missing_squares = self._get_initial_pos_missing_squares(sensor_map)
+    def _engine_start(self, ecb):
+        ecb.engine = chess.uci.popen_engine(ecb.path_to_engine)
 
-            self.driver.leds_blink(missing_squares)
+    def _attempt_start(self, ecb):
+        sensors_map = ecb.driver.sensors_get()
+        print(str(sensors_map))
+        position_type = self._detect_position_type(sensors_map)
+
+        if position_type == self.POSITION_NEW:
+            unknown_squares = self._new_game_unknown_squares(sensors_map)
+            if len(unknown_squares):
+                ecb.driver.leds_blink(unknown_squares)
+                return
+
+            ecb.board = chess.Board(chess.STARTING_FEN)
         else:
-            # TODO
-            print("Further setup needed to set position.")
+            print("TODO: custom position")
+            return
 
-        return None
+        ecb.driver.leds_blink()
+        ecb.driver.clock_start(ecb.board.turn)
 
-    def _game_start(self):
-        def on_uci_done():
-            self.current_state({'type': self.EVENT['ENGINE_STARTED'],
-                                'data': None})
-
-        self.current_state = self._state_starting_game
-
-        if self.game_config['level'] != self.LEVEL['DISABLED']:
-            print("starting chess engine")
-
-            self.engine = chess.uci.popen_engine(self.path_to_engine)
-            self.engine.uci()
-            self.engine.ucinewgame(async_callback=on_uci_done)
+        if ecb.game_config.level == GameConfig.LEVEL_DISABLED:
+            print("Play against human")
+            ecb.event_queue.put((Event.game_started, None))
         else:
-            print("playing against human")
-            self.current_state({'type': self.EVENT['HUMAN_STARTED'],
-                                'data': None})
+            self._engine_start(ecb)
 
-    def _game_stop(self):
-        def on_quit_done():
-            self.current_state({'type': self.EVENT['ENGINE_STOPPED'],
-                                'data': None})
+    def run(self, ecb, event, event_data):
+        print("starting: " + str(event))
+        if event == Event.game_start and not ecb.driver.sensors_running():
+            ecb.game_config.update(ecb.driver)
+            ecb.driver.sensors_start()
 
-        self.current_state = self._state_stopping_game
+            # we need a small delay for the sensors to settle
+            Timer(1, self._attempt_start, [ecb]).start()
 
-        if self.game_config['level'] != self.LEVEL['DISABLED']:
-            self.engine.quit(on_quit_done)
-        else:
-            self.current_state({'type': self.EVENT['HUMAN_STOPPED'],
-                                'data': None})
+        if event == Event.sensors_changed:
+            self._attempt_start(ecb)
 
-    def _get_legal_moves(self, square):
+    def next(self, event):
+        if event == Event.game_started:
+            return Ecb.game
+        elif event == Event.game_start:
+            return Ecb.stopping
+
+        return Ecb.starting
+
+
+class Stopping(State):
+    def run(self, ecb, event, event_data):
+        print("stopping: " + str(event))
+        if event == Event.game_start:
+            ecb.driver.sensors_stop()
+            ecb.driver.btn_led_off(EcbDriver.CMD_LED_START)
+            ecb.driver.leds_blink()
+            ecb.driver.clock_stop(EcbDriver.CLOCK_BOTTOM)
+            ecb.driver.clock_stop(EcbDriver.CLOCK_TOP)
+            ecb.driver.clock_blank(EcbDriver.CLOCK_BOTTOM)
+            ecb.driver.clock_blank(EcbDriver.CLOCK_TOP)
+
+            ecb.event_queue.put((Event.game_stopped, None))
+
+    def next(self, event):
+        if event == Event.game_stopped:
+            return Ecb.idle
+
+        return Ecb.stopping
+
+
+class Game(State):
+    def _get_legal_moves(self, board, square):
         legal_moves = []
 
-        for move in self.board.legal_moves:
+        for move in board.legal_moves:
             if square == chess.SQUARE_NAMES[move.from_square]:
                 legal_moves.append(chess.SQUARE_NAMES[move.to_square])
 
         return legal_moves
 
-    def _chess_engine_position_analyze(self):
-        def on_go_finished(command):
-            self.current_state({'type': self.EVENT['CHESS_ENGINE_MOVED'],
-                                'data': command.result()})
+    def run(self, ecb, event, event_data):
+        print("game: " + str(event))
 
-        wtime_msec = (self.game_state['wtime']['min'] * 60 +
-                      self.game_state['wtime']['sec']) * 1000
-        btime_msec = (self.game_state['btime']['min'] * 60 +
-                      self.game_state['btime']['sec']) * 1000
+        if event == Event.sensors_changed:
+            if len(event_data) != 1:
+                raise Exception("TODO: More than one piece has changed")
 
-        self.engine.go(wtime=wtime_msec,
-                       btime=btime_msec,
-                       async_callback=on_go_finished)
+            self.from_sq = chess.SQUARE_NAMES.index(event_data[0])
+            legal_moves = self._get_legal_moves(ecb.board, event_data[0])
 
-    # FSM states
-    def _state_idle(self, ecb_event):
-        print("idle state: " + str(ecb_event))
+            if len(legal_moves) == 0:
+                return
 
-        if ecb_event['type'] == self.EVENT['SENSORS_CHANGED']:
-            print(ecb_event['data'])
+            move_started_ev_data = {
+                'from': event_data,
+                'legal_moves': legal_moves
+            }
+            ecb.event_queue.put((Event.move_started, move_started_ev_data))
 
-        if ecb_event['type'] == self.EVENT['BUTTON_PRESSED']:
-            if ecb_event['data'] & self.driver.CMD_BTN_MODE:
-                self.game_config['mode'] ^= 1
+        if event == Event.move_ended:
+            to_sq = chess.SQUARE_NAMES.index(event_data[0])
 
-            if ecb_event['data'] & self.driver.CMD_BTN_OPP_LEVEL:
-                self.game_config['level'] = (self.game_config['level'] + 1) & 3
+            move = chess.Move(from_square=self.from_sq, to_square=to_sq)
 
-            if ecb_event['data'] & self.driver.CMD_BTN_OPP_COLOR:
-                self.game_config['engine_color'] ^= 1
+            ecb.driver.clock_stop(ecb.board.turn)
+            ecb.board.push(move)
+            ecb.driver.clock_start(ecb.board.turn)
 
-            if ecb_event['data'] & self.driver.CMD_BTN_GAME_TIME:
-                if self.game_config['time']['min'] == 0:
-                    self.game_config['time']['min'] = 90
-                else:
-                    self.game_config['time']['min'] -= 10
+        if event == Event.game_config:
+            if not event_data & EcbDriver.CMD_BTN_MODE:
+                return
 
-                if self.game_config['time']['min']:
-                    minutes = self.game_config['time']['min']
-                    sec = self.game_config['time']['sec']
+            ecb.game_config.mode_change()
+            ecb.game_config.update_leds(ecb.driver)
 
-                    self.driver.clock_set(self.driver.CLOCK_BOTTOM, minutes, sec)
-                    self.driver.clock_set(self.driver.CLOCK_TOP, minutes, sec)
-                else:
-                    self.driver.clock_blank(self.driver.CLOCK_BOTTOM)
-                    self.driver.clock_blank(self.driver.CLOCK_TOP)
+    def next(self, event):
+        if event == Event.game_start:
+            return Ecb.stopping
+        elif event == Event.move_started:
+            return Ecb.move
 
-            if ecb_event['data'] & self.driver.CMD_BTN_GAME_START:
-                self.driver.sensors_start()
-
-                self.game_state['wtime'] = self.game_config['time']
-                self.game_state['btime'] = self.game_config['time']
-                self.game_state['move_turn'] = self.COLOR['WHITE']
-                self.game_state['current_clock'] = self.driver.CLOCK_BOTTOM
-                self.game_state['moves'] = []
-
-                Timer(1, self._game_start)
-
-        self._cmd_panel_leds_update()
-
-    def _state_starting_game(self, ecb_event):
-        print("starting game state: " + str(ecb_event))
-
-        self.driver.btn_led_on(self.driver.CMD_LED_START)
-        sensor_map = self.driver.sensors_get()
-
-        if ecb_event['type'] == self.EVENT['BUTTON_PRESSED'] and \
-                (ecb_event['data'] & self.driver.CMD_BTN_GAME_START):
-            self._game_stop()
-
-        if ecb_event['type'] == self.EVENT['SENSORS_CHANGED'] or\
-                ecb_event['type'] == self.EVENT['ENGINE_STARTED'] or\
-                ecb_event['type'] == self.EVENT['HUMAN_STARTED']:
-
-            chess_position = self._get_initial_position(sensor_map)
-            if chess_position is not None:
-                self.board = chess.Board(chess_position)
-
-                if self.game_config['level'] != self.LEVEL['DISABLED'] and\
-                        self.game_state['move_turn'] == self.game_config['engine_color']:
-                    self.engine.position(self.board)
-                    self._chess_engine_position_analyze()
-
-                self.driver.clock_start(self.game_state['current_clock'])
-
-                self.current_state = self._state_game
-
-    def _state_stopping_game(self, ecb_event):
-        print("stopping game state: " + str(ecb_event))
-        if ecb_event['type'] in [self.EVENT['ENGINE_STOPPED'], self.EVENT['HUMAN_STOPPED']]:
-            self.driver.sensors_stop()
-            self.driver.btn_led_off(self.driver.CMD_LED_START)
-            self.driver.leds_blink()
-            self.driver.clock_stop(self.driver.CLOCK_BOTTOM)
-            self.driver.clock_stop(self.driver.CLOCK_TOP)
-            self.current_state = self._state_idle
-
-    def _state_game(self, ecb_event):
-        print("game state: " + str(ecb_event))
-        if ecb_event['type'] == self.EVENT['SENSORS_CHANGED']:
-            if len(ecb_event['data']) == 1:
-                self.game_state['current_move']['from'] = ecb_event['data'][0]
-
-                self.driver.leds_on(self._get_legal_moves([ecb_event['data'][0]]))
-
-                if not self.game_state['legal_moves']:
-                    return
-
-                self.driver.leds_blink(self.ecb_event['data'])
-
-                self.current_state = self._state_move
-
-        if ecb_event['type'] == self.EVENT['BUTTON_PRESSED'] and \
-                (ecb_event['data'] & self.driver.CMD_BTN_GAME_START):
-            self._game_stop()
-
-        if ecb_event['type'] == self.EVENT['CHESS_ENGINE_MOVED']:
-            self._toggle_clock()
-            self.driver.leds_blink([ecb_event['data']['from']],
-                                   [ecb_event['data']['to']])
-            self.game_state['move_turn'] ^= 1
-            self.board.push_san(ecb_event['data']['from'] +
-                                ecb_event['data']['to'])
-            self.game_state['current_move'] = ecb_event['data']
-
-            self.current_state = self._state_engine_move
+        return Ecb.game
 
 
+class Move(State):
+    def run(self, ecb, event, event_data):
+        if event == Event.move_started:
+            self.move_start = event_data
+
+            ecb.driver.leds_blink(event_data['from'])
+
+            if ecb.game_config.mode == GameConfig.MODE_LEARN:
+                ecb.driver.leds_on(event_data['legal_moves'])
+
+        if event == Event.sensors_changed:
+            if len(event_data) != 1:
+                raise Exception("TODO: More than one piece has changed")
+
+            if event_data != self.move_start['from'] and\
+                    event_data[0] not in self.move_start['legal_moves']:
+                return
+
+            if self.move_start['from'] == event_data:
+                ecb.event_queue.put((Event.move_aborted, None))
+
+            if event_data[0] in self.move_start['legal_moves']:
+                ecb.event_queue.put((Event.move_ended, event_data))
+
+            if ecb.game_config.mode == GameConfig.MODE_LEARN:
+                ecb.driver.leds_off(self.move_start['legal_moves'])
+
+            ecb.driver.leds_blink()
+
+    def next(self, event):
+        if event == Event.move_ended:
+            return Ecb.game
+        elif event == Event.move_aborted:
+            return Ecb.game
+        elif event == Event.game_start:
+            return Ecb.stopping
+
+        return Ecb.move
+
+
+class GameConfig(object):
+    MODE_NORMAL = 0
+    MODE_LEARN = 1
+
+    COLOR_BLACK = 0
+    COLOR_WHITE = 1
+
+    LEVEL_DISABLED = 0
+    LEVEL_EASY = 1
+    LEVEL_MEDIUM = 2
+    LEVEL_HARD = 3
+
+    LEVEL_LED_MAP = [
+        [0, 0, 0],  # LEVEL_DISABLED
+        [1, 0, 0],  # LEVEL_EASY
+        [0, 1, 0],  # LEVEL_MEDIUM
+        [0, 0, 1],  # LEVEL_HARD
+    ]
+
+    def __init__(self):
+        self.mode = GameConfig.MODE_LEARN
+        self.level = GameConfig.LEVEL_DISABLED
+        self.opp_color = GameConfig.COLOR_WHITE
+        self.time = {'min': 90, 'sec': 0}
+
+    def mode_change(self):
+        self.mode ^= 1
+
+        return self.mode
+
+    def opp_color_change(self):
+        self.opp_color ^= 1
+
+        return self.opp_color
+
+    def time_change(self):
+        if self.time['min'] == 0:
+            self.time['min'] = 90
+        else:
+            self.time['min'] -= 10
+
+    def level_change(self):
+        self.level = (self.level + 1) & 0x3
+
+    def update_clocks(self, driver):
+        if self.time['min']:
+            driver.clock_set(EcbDriver.CLOCK_BOTTOM, self.time['min'], 0)
+            driver.clock_set(EcbDriver.CLOCK_TOP, self.time['min'], 0)
+        else:
+            driver.clock_blank(EcbDriver.CLOCK_BOTTOM)
+            driver.clock_blank(EcbDriver.CLOCK_TOP)
+
+    def update_leds(self, driver):
+        mode_cmd = [driver.btn_led_off, driver.btn_led_on][self.mode]
+        level_led_map = GameConfig.LEVEL_LED_MAP[self.level]
+        color_cmd = [driver.btn_led_off, driver.btn_led_on][self.opp_color]
+
+        mode_cmd(driver.CMD_LED_MODE)
+        color_cmd(driver.CMD_LED_OPP_COLOR)
+
+        for i in range(0, 3):
+            level_cmd = [driver.btn_led_off, driver.btn_led_on][level_led_map[i]]
+            level_cmd(1 << (i + 2))
+
+    def update(self, driver):
+        self.update_clocks(driver)
+        self.update_leds(driver)
+
+
+class Ecb(StateMachine):
+    def __init__(self, driver, path_to_engine):
+        self.event_queue = Queue.Queue()
+        self.driver = driver
+        self.driver.set_callbacks(self._sensors_callback,
+                                  self._clock_expired_callback,
+                                  self._cmd_callback)
+        self.game_config = GameConfig()
+        self.game_config.update(self.driver)
+
+        self.board = None
+
+        self.path_to_engine = path_to_engine
+        self.engine = chess.uci.popen_engine(path_to_engine)
+
+        super(Ecb, self).__init__(Ecb.idle)
+
+        print("EcbFSM ready")
+
+    def _sensors_callback(self, changed_squares):
+        print("sensors callback: " + str(changed_squares))
+        self.event_queue.put((Event.sensors_changed, changed_squares))
+
+    def _clock_expired_callback(self, clock_id):
+        print("clock expired: " + str(clock_id))
+        self.event_queue.put((Event.clock_expired, clock_id))
+
+    def _cmd_callback(self, buttons_mask):
+        print("buttons pressed: " + str(buttons_mask))
+        if buttons_mask & EcbDriver.CMD_BTN_GAME_START:
+            self.event_queue.put((Event.game_start, None))
+        else:
+            self.event_queue.put((Event.game_config, buttons_mask))
+
+    def handle_events(self):
+        while True:
+            try:
+                event, event_data = self.event_queue.get(True, 1)
+                self.handle(self, event, event_data)
+                self.event_queue.task_done()
+            except Queue.Empty:
+                pass
+
+
+Ecb.idle = Idle()
+Ecb.setup = Setup()
+Ecb.starting = Starting()
+Ecb.stopping = Stopping()
+Ecb.game = Game()
+Ecb.move = Move()
+
+if __name__ == "__main__":
+    driver = EcbDriver()
+    ecb = Ecb(driver, '/home/root/stockfish')
+    ecb.handle_events()

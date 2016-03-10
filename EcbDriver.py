@@ -106,7 +106,8 @@ class HbController(Controller):
 
     # returns a bytearray
     def sensors_read(self):
-        return self.readBytesReg(self.REGS['sensor_row_0'], 4)
+        sr = self.readBytesReg(self.REGS['sensor_row_0'], 4)
+        return [sr[0], sr[1], sr[2], sr[3]]
 
     # returns a bytearray
     def leds_read(self):
@@ -153,8 +154,8 @@ class EcbDriver(object):
     # my leds are wired in reverse order... :/
     LED_COLUMNS = "hgfedcba"
 
-    CLOCK_BOTTOM = 0
-    CLOCK_TOP = 1
+    CLOCK_TOP = 0
+    CLOCK_BOTTOM = 1
 
     # command panel button IDs
     CMD_BTN_MODE = 1 << 0
@@ -180,6 +181,8 @@ class EcbDriver(object):
 
         self.led_map = [0, 0, 0, 0, 0, 0, 0, 0]
         self.sensor_map = [0, 0, 0, 0, 0, 0, 0, 0]
+
+        self.sensors_started = False
 
         self.blink_onoff_map = [0, 0, 0, 0, 0, 0, 0, 0]
         self.blink_offon_map = [0, 0, 0, 0, 0, 0, 0, 0]
@@ -357,12 +360,20 @@ class EcbDriver(object):
         self.top.sensor_scan_switch(1)
         self.bot.sensor_scan_switch(1)
 
+        self.sensors_started = True
+
     def sensors_stop(self):
         self.top.sensor_scan_switch(0)
         self.bot.sensor_scan_switch(0)
 
+        self.sensors_started = False
+
     def sensors_get(self):
+        self.sensor_map = self.bot.sensors_read() + self.top.sensors_read()
         return self.sensor_map
+
+    def sensors_running(self):
+        return self.sensors_started
 
     # Clock API
     def clock_set(self, clock_id, min, sec):
@@ -376,17 +387,17 @@ class EcbDriver(object):
         ctrl.clock_get()
 
     def clock_start(self, clock_id):
-        ctrl = [self.bot, self.top][clock_id]
+        ctrl = [self.top, self.bot][clock_id]
 
         ctrl.clock_switch(1)
 
     def clock_stop(self, clock_id):
-        ctrl = [self.bot, self.top][clock_id]
+        ctrl = [self.top, self.bot][clock_id]
 
         ctrl.clock_switch(0)
 
     def clock_blank(self, clock_id):
-        ctrl = [self.bot, self.top][clock_id]
+        ctrl = [self.top, self.bot][clock_id]
 
         ctrl.clock_blank()
 
