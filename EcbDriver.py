@@ -377,12 +377,12 @@ class EcbDriver(object):
 
     # Clock API
     def clock_set(self, clock_id, min, sec):
-        ctrl = [self.bot, self.top][clock_id]
+        ctrl = [self.top, self.bot][clock_id]
 
         ctrl.clock_set(min, sec)
 
     def clock_get(self, clock_id):
-        ctrl = [self.bot, self.top][clock_id]
+        ctrl = [self.top, self.bot][clock_id]
 
         return ctrl.clock_get()
 
