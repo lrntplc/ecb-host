@@ -8,6 +8,37 @@ import Queue
 from threading import Timer
 
 
+class Interval(object):
+    def __init__(self, timeout, timer_function, args):
+        self.timeout = timeout
+        self.timer_function = timer_function
+        self.args = args
+        self.timer = None
+
+    def start(self):
+        def wrapper():
+            self.timer_function(self.args)
+            self.start()
+
+        self.timer = Timer(self.timeout, wrapper)
+        self.timer.start()
+
+    def cancel(self):
+        if self.timer is not None:
+            self.timer.cancel()
+
+
+def set_interval(timeout, timer_function, args):
+    def interval_wrapper():
+        timer_function(args)
+        set_interval(timeout, timer_function, args)
+
+    interval = Timer(timeout, interval_wrapper)
+    interval.start()
+
+    return interval
+
+
 class State(object):
     def run(self, ecb, event, event_data=None):
         assert 0, "not implemented"
@@ -25,16 +56,22 @@ class Event(object):
 
 Event.sensors_changed = Event("sensors changed")
 Event.clock_expired = Event("clock expired")
+
 Event.game_config_btn = Event("one of the config buttons was pressed")
 Event.game_start_btn = Event("start game button was pressed")
 Event.game_started = Event("game started")
 Event.game_stopped = Event("game stopped")
 Event.game_over = Event("game over")
+Event.game_force_stop = Event("start button was pressed twice")
+Event.game_resume = Event("game resumed")
+
 Event.stray_events = Event("too many square events received")
 Event.error_end = Event("error condition has ended")
+
 Event.move_started = Event("move started")
 Event.move_ended = Event("move ended")
 Event.move_aborted = Event("move aborted")
+
 Event.engine_move_started = Event("engine indicated a move")
 Event.engine_move_ended = Event("engine piece was moved")
 
@@ -200,7 +237,7 @@ class Starting(State):
 class Stopping(State):
     def run(self, ecb, event, event_data):
         print("stopping: " + str(event))
-        if event == Event.game_start_btn:
+        if event == Event.game_force_stop:
             ecb.driver.sensors_stop()
             ecb.driver.btn_led_off(EcbDriver.CMD_LED_START)
             ecb.driver.leds_blink()
@@ -368,7 +405,7 @@ class Game(State):
 
     def next(self, event):
         if event == Event.game_start_btn:
-            return Ecb.stopping
+            return Ecb.game_pause
         elif event == Event.move_started:
             return Ecb.move
         elif event == Event.engine_move_started:
@@ -416,8 +453,6 @@ class Move(State):
             return Ecb.game
         elif event == Event.move_aborted:
             return Ecb.game
-        elif event == Event.game_start_btn:
-            return Ecb.stopping
         elif event == Event.clock_expired:
             return Ecb.game_end
 
@@ -547,10 +582,87 @@ class GameError(State):
 
 
 class GamePause(State):
+    def __init__(self):
+        self.timer = None
+        self.paused = False
+
+    def _can_stop_timeout(self):
+        self.timer = None
+        self.paused = True
+
+    def _engine_go(self, ecb):
+        def engine_on_go_finished(command):
+            ecb.bestmove, ecb.pondermove = command.result()
+            print("bestmove move: %s, ponder: %s" %
+                  (ecb.bestmove.uci(), ecb.pondermove.uci()))
+
+            ecb.event_queue.put((Event.engine_move_started,
+                                 (ecb.bestmove, ecb.pondermove)))
+
+        wtime = ecb.time[chess.WHITE]
+        btime = ecb.time[chess.BLACK]
+        wtime_msec = (wtime['min'] * 60 + wtime['sec']) * 1000
+        btime_msec = (btime['min'] * 60 + btime['sec']) * 1000
+
+        ecb.engine.position(ecb.board)
+        ecb.engine.go(wtime=wtime_msec, btime=btime_msec,
+                      async_callback=engine_on_go_finished)
+
     def run(self, ecb, event, event_data):
-        pass
+        if event == Event.game_start_btn:
+            if self.timer is None:
+                if not self.paused:
+                    print("pausing....")
+                    ecb.driver.clock_stop(ecb.board.turn)
+                    ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+
+                    if ecb.board.turn == ecb.game_config.opp_color and \
+                            ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                        ecb.engine.stop()
+
+                    self.led_blink = Interval(1,
+                                              ecb.driver.btn_led_toggle,
+                                              EcbDriver.CMD_LED_START)
+                    self.led_blink.start()
+
+                    self.timer = Timer(3, self._can_stop_timeout)
+                    self.timer.start()
+                else:
+                    print("resuming...")
+                    if ecb.board.turn == ecb.game_config.opp_color and \
+                            ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                        self._engine_go(ecb)
+
+                    ecb.driver.clock_start(ecb.board.turn)
+
+                    ecb.event_queue.put((Event.game_resume, None))
+
+                    if self.led_blink is not None:
+                        self.led_blink.cancel()
+
+                    ecb.driver.btn_led_on(EcbDriver.CMD_LED_START)
+
+                    self.paused = False
+
+            else:  # button was pressed the second time before the timer expire
+                print("stopping...")
+                ecb.event_queue.put((Event.game_force_stop, None))
+
+                if self.led_blink is not None:
+                    self.led_blink.cancel()
+
+                if self.timer is not None:
+                    self.timer.cancel()
+                    self.timer = None
+
+                self.paused = False
 
     def next(self, event):
+        if event == Event.game_force_stop:
+            return Ecb.stopping
+        elif event == Event.game_resume:
+            return Ecb.game
+
         return Ecb.game_pause
 
 
@@ -684,6 +796,7 @@ Ecb.stopping = Stopping()
 Ecb.game = Game()
 Ecb.game_end = GameEnd()
 Ecb.game_error = GameError()
+Ecb.game_pause = GamePause()
 Ecb.move = Move()
 Ecb.engine_move = EngineMove()
 

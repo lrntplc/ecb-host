@@ -147,6 +147,13 @@ class CmdController(Controller):
 
         reg_cmd(self.REGS['leds'], led_mask)
 
+    def leds_toggle(self, led_mask):
+        leds = self.readReg(self.REGS['leds'])
+
+        leds ^= led_mask
+
+        self.writeReg(self.REGS['leds'], leds)
+
 
 class EcbDriver(object):
     SENSOR_COLUMNS = "abcdefgh"
@@ -407,6 +414,9 @@ class EcbDriver(object):
 
     def btn_led_off(self, led_mask):
         self.cmd.leds_switch(led_mask, 0)
+
+    def btn_led_toggle(self, led_mask):
+        self.cmd.leds_toggle(led_mask)
 
 
 if __name__ == "__main__":
