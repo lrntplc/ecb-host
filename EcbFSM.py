@@ -174,6 +174,7 @@ class Starting(State):
         return unknown_squares
 
     def _attempt_start(self, ecb):
+        self.ignore_sensor_events = False
         sensors_map = ecb.driver.sensors_get()
         print(str(sensors_map))
         position_type = self._detect_position_type(sensors_map)
@@ -220,9 +221,10 @@ class Starting(State):
             ecb.driver.sensors_start()
 
             # we need a small delay for the sensors to settle
+            self.ignore_sensor_events = True
             Timer(1, self._attempt_start, [ecb]).start()
 
-        if event == Event.sensors_changed:
+        if event == Event.sensors_changed and not self.ignore_sensor_events:
             self._attempt_start(ecb)
 
     def next(self, event):
