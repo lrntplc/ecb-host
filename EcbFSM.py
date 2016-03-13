@@ -25,11 +25,13 @@ class Event(object):
 
 Event.sensors_changed = Event("sensors changed")
 Event.clock_expired = Event("clock expired")
-Event.game_config = Event("one of the config buttons was pressed")
-Event.game_start = Event("start game button was pressed")
+Event.game_config_btn = Event("one of the config buttons was pressed")
+Event.game_start_btn = Event("start game button was pressed")
 Event.game_started = Event("game started")
 Event.game_stopped = Event("game stopped")
 Event.game_over = Event("game over")
+Event.stray_events = Event("too many square events received")
+Event.error_end = Event("error condition has ended")
 Event.move_started = Event("move started")
 Event.move_ended = Event("move ended")
 Event.move_aborted = Event("move aborted")
@@ -51,9 +53,9 @@ class Idle(State):
         print("idle: " + str(event))
 
     def next(self, event):
-        if event == Event.game_config:
+        if event == Event.game_config_btn:
             return Ecb.setup
-        if event == Event.game_start:
+        if event == Event.game_start_btn:
             return Ecb.starting
 
         return Ecb.idle
@@ -62,7 +64,7 @@ class Idle(State):
 class Setup(State):
     def run(self, ecb, event, event_data):
         print("setup: " + str(event))
-        if event != Event.game_config:
+        if event != Event.game_config_btn:
             return
 
         if event_data & EcbDriver.CMD_BTN_MODE:
@@ -77,7 +79,7 @@ class Setup(State):
         ecb.game_config.update(ecb.driver)
 
     def next(self, event):
-        if event == Event.game_start:
+        if event == Event.game_start_btn:
             return Ecb.starting
 
         return Ecb.setup
@@ -176,7 +178,7 @@ class Starting(State):
 
     def run(self, ecb, event, event_data):
         print("starting: " + str(event))
-        if event == Event.game_start and not ecb.driver.sensors_running():
+        if event == Event.game_start_btn and not ecb.driver.sensors_running():
             ecb.game_config.update(ecb.driver)
             ecb.driver.sensors_start()
 
@@ -189,7 +191,7 @@ class Starting(State):
     def next(self, event):
         if event == Event.game_started:
             return Ecb.game
-        elif event == Event.game_start:
+        elif event == Event.game_start_btn:
             return Ecb.stopping
 
         return Ecb.starting
@@ -198,7 +200,7 @@ class Starting(State):
 class Stopping(State):
     def run(self, ecb, event, event_data):
         print("stopping: " + str(event))
-        if event == Event.game_start:
+        if event == Event.game_start_btn:
             ecb.driver.sensors_stop()
             ecb.driver.btn_led_off(EcbDriver.CMD_LED_START)
             ecb.driver.leds_blink()
@@ -291,8 +293,26 @@ class Game(State):
             ecb.driver.btn_led_on(EcbDriver.CMD_LED_START)
 
         if event == Event.sensors_changed:
-            if len(event_data) != 1:
-                raise Exception("TODO: More than one piece has changed")
+            if len(event_data) > 2:
+                ecb.event_queue.put((Event.stray_events, event_data))
+                return
+
+            if len(event_data) == 2:
+                sq1 = chess.SQUARE_NAMES.index(event_data[0])
+                sq2 = chess.SQUARE_NAMES.index(event_data[1])
+                if ecb.board.piece_at(sq1) and ecb.board.piece_at(sq2):
+                    ecb.event_queue.put((Event.stray_events, event_data))
+                else:
+                    if ecb.board.piece_at(sq1):
+                        self.from_sq = sq1
+                        event_data.pop(event_data.index(event_data[0]))
+                    else:
+                        self.from_sq = sq2
+                        event_data.pop(event_data.index(event_data[1]))
+
+                    ecb.event_queue.put((Event.move_ended, event_data))
+
+                return
 
             # ignore events from engine pieces
             if ecb.board.turn == ecb.game_config.opp_color and \
@@ -339,7 +359,7 @@ class Game(State):
 
             ecb.driver.clock_start(ecb.board.turn)
 
-        if event == Event.game_config:
+        if event == Event.game_config_btn:
             if not event_data & EcbDriver.CMD_BTN_MODE:
                 return
 
@@ -347,7 +367,7 @@ class Game(State):
             ecb.game_config.update_leds(ecb.driver)
 
     def next(self, event):
-        if event == Event.game_start:
+        if event == Event.game_start_btn:
             return Ecb.stopping
         elif event == Event.move_started:
             return Ecb.move
@@ -355,6 +375,8 @@ class Game(State):
             return Ecb.engine_move
         elif event == Event.clock_expired or event == Event.game_over:
             return Ecb.game_end
+        elif event == Event.stray_events:
+            return Ecb.game_error
 
         return Ecb.game
 
@@ -371,7 +393,8 @@ class Move(State):
 
         if event == Event.sensors_changed:
             if len(event_data) != 1:
-                raise Exception("TODO: More than one piece has changed")
+                ecb.event_queue.put((Event.stray_events, event_data))
+                return
 
             if event_data != self.move_start['from'] and\
                     event_data[0] not in self.move_start['legal_moves']:
@@ -393,7 +416,7 @@ class Move(State):
             return Ecb.game
         elif event == Event.move_aborted:
             return Ecb.game
-        elif event == Event.game_start:
+        elif event == Event.game_start_btn:
             return Ecb.stopping
         elif event == Event.clock_expired:
             return Ecb.game_end
@@ -491,10 +514,44 @@ class GameEnd(State):
                                       self.winner_blinking_leds[1])
 
     def next(self, event):
-        if event == Event.game_start:
+        if event == Event.game_start_btn:
             return Ecb.stopping
 
         return Ecb.game_end
+
+
+class GameError(State):
+    def run(self, ecb, event, event_data):
+        if event == Event.stray_events:
+            self.sq_list = event_data
+
+            ecb.driver.leds_blink(event_data)
+
+        if event == Event.sensors_changed:
+            for sq in event_data:
+                if sq in self.sq_list:
+                    self.sq_list.pop(self.sq_list.index(sq))
+                else:
+                    self.sq_list.append(sq)
+
+            ecb.driver.leds_blink(self.sq_list)
+
+            if not len(self.sq_list):
+                ecb.event_queue.put((Event.error_end, None))
+
+    def next(self, event):
+        if event == Event.error_end:
+            return Ecb.game
+
+        return Ecb.game_error
+
+
+class GamePause(State):
+    def run(self, ecb, event, event_data):
+        pass
+
+    def next(self, event):
+        return Ecb.game_pause
 
 
 class GameConfig(object):
@@ -606,9 +663,9 @@ class Ecb(StateMachine):
     def _cmd_callback(self, buttons_mask):
         print("buttons pressed: " + str(buttons_mask))
         if buttons_mask & EcbDriver.CMD_BTN_GAME_START:
-            self.event_queue.put((Event.game_start, None))
+            self.event_queue.put((Event.game_start_btn, None))
         else:
-            self.event_queue.put((Event.game_config, buttons_mask))
+            self.event_queue.put((Event.game_config_btn, buttons_mask))
 
     def handle_events(self):
         while True:
@@ -626,6 +683,7 @@ Ecb.starting = Starting()
 Ecb.stopping = Stopping()
 Ecb.game = Game()
 Ecb.game_end = GameEnd()
+Ecb.game_error = GameError()
 Ecb.move = Move()
 Ecb.engine_move = EngineMove()
 
