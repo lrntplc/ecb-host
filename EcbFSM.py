@@ -75,6 +75,9 @@ Event.move_aborted = Event("move aborted")
 Event.engine_move_started = Event("engine indicated a move")
 Event.engine_move_ended = Event("engine piece was moved")
 
+Event.promotion_started = Event("piece promotion started")
+Event.promotion_ended = Event("piece promotion ended")
+
 
 class StateMachine(object):
     def __init__(self, initial_state):
@@ -187,7 +190,8 @@ class Starting(State):
 
             ecb.board = chess.Board(chess.STARTING_FEN)
         else:
-            print("TODO: custom position")
+            print("Custom position...")
+            # ecb.board = chess.Board("4k3/7P/8/8/8/8/p7/4K3 w - - 0 1")
             return
 
         ecb.driver.leds_blink()
@@ -372,8 +376,11 @@ class Game(State):
 
         if event == Event.move_ended:
             to_sq = chess.SQUARE_NAMES.index(event_data[0])
+            promotion = event_data[1]
 
-            move = chess.Move(from_square=self.from_sq, to_square=to_sq)
+            move = chess.Move(from_square=self.from_sq,
+                              to_square=to_sq,
+                              promotion=promotion)
 
             ecb.driver.clock_stop(ecb.board.turn)
             ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
@@ -421,34 +428,52 @@ class Game(State):
 
 
 class Move(State):
+    def _is_promotion(self, ecb, move_start, move_end):
+        sq_from = chess.SQUARE_NAMES.index(move_start)
+        sq_to = chess.SQUARE_NAMES.index(move_end)
+        piece_type = ecb.board.piece_type_at(sq_from)
+
+        if not piece_type == chess.PAWN:
+            return False
+
+        if chess.rank_index(sq_to) == 7:
+            return True
+
+        return False
+
     def run(self, ecb, event, event_data):
         if event == Event.move_started:
-            self.move_start = event_data
+            self.sq_from = event_data['from'][0]
+            self.legal_moves = event_data['legal_moves']
 
-            ecb.driver.leds_blink(event_data['from'])
+            ecb.driver.leds_blink([self.sq_from])
 
             if ecb.game_config.mode == GameConfig.MODE_LEARN:
-                ecb.driver.leds_on(event_data['legal_moves'])
+                ecb.driver.leds_on(self.legal_moves)
 
         if event == Event.sensors_changed:
             if len(event_data) != 1:
                 ecb.event_queue.put((Event.stray_events, event_data))
                 return
 
-            if event_data != self.move_start['from'] and\
-                    event_data[0] not in self.move_start['legal_moves']:
+            if event_data != self.sq_from and\
+                    event_data[0] not in self.legal_moves:
                 return
 
-            if self.move_start['from'] == event_data:
+            if self.sq_from == event_data:
                 ecb.event_queue.put((Event.move_aborted, None))
 
-            if event_data[0] in self.move_start['legal_moves']:
-                ecb.event_queue.put((Event.move_ended, event_data))
-
             if ecb.game_config.mode == GameConfig.MODE_LEARN:
-                ecb.driver.leds_off(self.move_start['legal_moves'])
+                ecb.driver.leds_off(self.legal_moves)
 
             ecb.driver.leds_blink()
+
+            self.sq_to = event_data[0]
+
+            if self._is_promotion(ecb, self.sq_from, self.sq_to):
+                ecb.event_queue.put((Event.promotion_started, self.sq_to))
+            else:
+                ecb.event_queue.put((Event.move_ended, (self.sq_to, None)))
 
     def next(self, event):
         if event == Event.move_ended:
@@ -457,6 +482,8 @@ class Move(State):
             return Ecb.game
         elif event == Event.clock_expired:
             return Ecb.game_end
+        elif event == Event.promotion_started:
+            return Ecb.piece_promotion
 
         return Ecb.move
 
@@ -486,6 +513,19 @@ class EngineMove(State):
         ecb.engine.go(wtime=wtime_msec, btime=btime_msec, ponder=True,
                       async_callback=engine_on_go_finished)
 
+    def _signal_promotion(self, ecb, chess_piece_type):
+        promotion_led_map = {
+            chess.QUEEN: EcbDriver.CMD_LED_MODE,
+            chess.ROOK: EcbDriver.CMD_LED_OPP_LEVEL0,
+            chess.BISHOP: EcbDriver.CMD_LED_OPP_COLOR,
+            chess.KNIGHT: EcbDriver.CMD_LED_START,
+        }
+
+        self.promotion_interval = Interval(0.5,
+                                           ecb.driver.btn_led_toggle,
+                                           promotion_led_map[chess_piece_type])
+        self.promotion_interval.start()
+
     def run(self, ecb, event, event_data):
         if event == Event.engine_move_started:
             bestmove = event_data[0]
@@ -493,11 +533,16 @@ class EngineMove(State):
 
             self.from_sq = chess.SQUARE_NAMES[bestmove.from_square]
             self.to_sq = chess.SQUARE_NAMES[bestmove.to_square]
+            self.promotion = bestmove.promotion
 
             ecb.driver.leds_blink([self.from_sq], [self.to_sq])
             ecb.driver.clock_stop(ecb.board.turn)
             ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
             ecb.board.push(bestmove)
+
+            if self.promotion is not None:
+                ecb.driver.btn_led_off(0xff)
+                self._signal_promotion(ecb, self.promotion)
 
             if ecb.board.is_game_over():
                 ecb.event_queue.put((Event.game_over, None))
@@ -520,6 +565,10 @@ class EngineMove(State):
                 self.from_sq = ''
             elif event_data[0] == self.to_sq and self.from_sq == '':
                 ecb.driver.leds_blink()
+
+                if self.promotion is not None:
+                    self.promotion_interval.cancel()
+                    ecb.game_config.update_leds(ecb.driver)
 
                 ecb.event_queue.put((Event.engine_move_ended, None))
 
@@ -668,6 +717,46 @@ class GamePause(State):
         return Ecb.game_pause
 
 
+class PiecePromotion(State):
+    def run(self, ecb, event, event_data):
+        if event == Event.promotion_started:
+            self.to_sq = event_data
+
+            led_mask = EcbDriver.CMD_LED_START |\
+                EcbDriver.CMD_LED_MODE |\
+                EcbDriver.CMD_LED_OPP_LEVEL0 |\
+                EcbDriver.CMD_LED_OPP_COLOR
+
+            ecb.driver.btn_led_off(0xff)
+            self.blink_interval = Interval(0.5,
+                                           ecb.driver.btn_led_toggle,
+                                           led_mask)
+            self.blink_interval.start()
+
+        if event == Event.game_config_btn or event == Event.game_start_btn:
+            if event_data is None:
+                promotion = chess.KNIGHT
+            elif event_data & EcbDriver.CMD_BTN_GAME_TIME:
+                pass
+            elif event_data & EcbDriver.CMD_BTN_MODE:
+                promotion = chess.QUEEN
+            elif event_data & EcbDriver.CMD_BTN_OPP_LEVEL:
+                promotion = chess.ROOK
+            else:
+                promotion = chess.BISHOP
+
+            self.blink_interval.cancel()
+            ecb.game_config.update_leds(ecb.driver)
+
+            ecb.event_queue.put((Event.move_ended, (self.to_sq, promotion)))
+
+    def next(self, event):
+        if event == Event.move_ended:
+            return Ecb.game
+
+        return Ecb.piece_promotion
+
+
 class GameConfig(object):
     MODE_NORMAL = 0
     MODE_LEARN = 1
@@ -688,7 +777,7 @@ class GameConfig(object):
         self.mode = GameConfig.MODE_LEARN
         self.level = GameConfig.LEVEL_HARD
         self.opp_color = chess.BLACK
-        self.time = {'min': 30, 'sec': 0}
+        self.time = {'min': 45, 'sec': 0}
 
     def mode_change(self):
         self.mode ^= 1
@@ -801,6 +890,7 @@ Ecb.game_error = GameError()
 Ecb.game_pause = GamePause()
 Ecb.move = Move()
 Ecb.engine_move = EngineMove()
+Ecb.piece_promotion = PiecePromotion()
 
 if __name__ == "__main__":
     driver = EcbDriver()
