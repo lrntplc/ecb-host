@@ -243,7 +243,7 @@ class Starting(State):
 class Stopping(State):
     def run(self, ecb, event, event_data):
         print("stopping: " + str(event))
-        if event == Event.game_force_stop:
+        if event in [Event.game_force_stop, Event.game_start_btn]:
             ecb.driver.sensors_stop()
             ecb.driver.btn_led_off(EcbDriver.CMD_LED_START)
             ecb.driver.leds_blink()
@@ -594,7 +594,7 @@ class GameEnd(State):
 
         if event == Event.game_over:
             if ecb.board.is_checkmate():
-                ecb.driver.leds_blink(self.winner_blinking_leds[ecb.board.turn])
+                ecb.driver.leds_blink(self.winner_blinking_leds[not ecb.board.turn])
             else:
                 ecb.driver.leds_blink(self.winner_blinking_leds[0] +
                                       self.winner_blinking_leds[1])
