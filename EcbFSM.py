@@ -6,6 +6,13 @@ import chess.uci
 import chess.polyglot
 import Queue
 from threading import Timer
+import logging
+
+
+class MyHandler(chess.uci.InfoHandler):
+    def post_info(self):
+        super(MyHandler, self).post_info()
+#[lp]        print(self.info)
 
 
 class Interval(object):
@@ -191,8 +198,9 @@ class Starting(State):
             ecb.board = chess.Board(chess.STARTING_FEN)
         else:
             print("Custom position...")
-            # ecb.board = chess.Board("4k3/7P/8/8/8/8/p7/4K3 w - - 0 1")
-            return
+            #ecb.board = chess.Board("4k3/7P/8/8/8/8/p7/4K3 w - - 0 1")
+            ecb.board = chess.Board("4k3/8/8/8/8/8/8/R3K2R w - - 0 1")
+            #return
 
         ecb.driver.leds_blink()
 
@@ -200,6 +208,8 @@ class Starting(State):
             print("Play against engine. Starting engine...")
             ecb.opening_book = chess.polyglot.MemoryMappedReader(ecb.path_to_opening_book)
             ecb.engine = chess.uci.popen_engine(ecb.path_to_engine)
+            ecb.info_handler = MyHandler()
+            ecb.engine.info_handlers.append(ecb.info_handler)
             ecb.engine.uci()
             skill_level = 20
             if ecb.game_config.level == GameConfig.LEVEL_EASY:
@@ -278,8 +288,11 @@ class Game(State):
     def _engine_go(self, ecb):
         def engine_on_go_finished(command):
             ecb.bestmove, ecb.pondermove = command.result()
-            print("bestmove move: %s, ponder: %s" %
-                  (ecb.bestmove.uci(), ecb.pondermove.uci()))
+            if ecb.pondermove is not None:
+                print("bestmove move: %s, ponder: %s" %
+                      (ecb.bestmove.uci(), ecb.pondermove.uci()))
+            else:
+                print("bestmove move: %s" % ecb.bestmove.uci())
 
             ecb.event_queue.put((Event.engine_move_started,
                                  (ecb.bestmove, ecb.pondermove)))
@@ -442,6 +455,7 @@ class Move(State):
         return False
 
     def run(self, ecb, event, event_data):
+        print("move: " + str(event))
         if event == Event.move_started:
             self.sq_from = event_data['from'][0]
             self.legal_moves = event_data['legal_moves']
@@ -456,12 +470,15 @@ class Move(State):
                 ecb.event_queue.put((Event.stray_events, event_data))
                 return
 
-            if event_data != self.sq_from and\
+            if event_data[0] != self.sq_from and\
                     event_data[0] not in self.legal_moves:
                 return
 
-            if self.sq_from == event_data:
+            if self.sq_from == event_data[0]:
                 ecb.event_queue.put((Event.move_aborted, None))
+                ecb.driver.leds_off(self.legal_moves)
+                ecb.driver.leds_blink()
+                return
 
             if ecb.game_config.mode == GameConfig.MODE_LEARN:
                 ecb.driver.leds_off(self.legal_moves)
@@ -495,8 +512,11 @@ class EngineMove(State):
                 return
 
             ecb.bestmove, ecb.pondermove = command.result()
-            print("ponder finished: bestmove: %s, ponder: %s" %
-                  (ecb.bestmove.uci(), ecb.pondermove.uci()))
+            if ecb.pondermove is not None:
+                print("ponder finished: bestmove: %s, ponder: %s" %
+                      (ecb.bestmove.uci(), ecb.pondermove.uci()))
+            else:
+                print("ponder finished: bestmove: %s" % ecb.bestmove.uci())
 
             ecb.event_queue.put((Event.engine_move_started,
                                  (ecb.bestmove, ecb.pondermove)))
@@ -527,6 +547,7 @@ class EngineMove(State):
         self.promotion_interval.start()
 
     def run(self, ecb, event, event_data):
+        print("EngineMove: " + str(event))
         if event == Event.engine_move_started:
             bestmove = event_data[0]
             pondermove = event_data[1]
@@ -588,6 +609,7 @@ class GameEnd(State):
     ]
 
     def run(self, ecb, event, event_data):
+        print("GameEnd: " + str(event))
         if event == Event.clock_expired:
 
             ecb.driver.leds_blink(self.winner_blinking_leds[not ecb.board.turn])
@@ -608,6 +630,7 @@ class GameEnd(State):
 
 class GameError(State):
     def run(self, ecb, event, event_data):
+        print("GameError: " + str(event))
         if event == Event.stray_events:
             self.sq_list = event_data
 
@@ -660,6 +683,7 @@ class GamePause(State):
                       async_callback=engine_on_go_finished)
 
     def run(self, ecb, event, event_data):
+        print("GamePause: " + str(event))
         if event == Event.game_start_btn:
             if self.timer is None:
                 if not self.paused:
@@ -719,6 +743,7 @@ class GamePause(State):
 
 class PiecePromotion(State):
     def run(self, ecb, event, event_data):
+        print("PiecePromotion: " + str(event))
         if event == Event.promotion_started:
             self.to_sq = event_data
 
@@ -844,6 +869,7 @@ class Ecb(StateMachine):
         self.path_to_opening_book = path_to_opening_book
         self.engine = None
         self.opening_book = None
+        self.info_handler = None
 
         self.time = [self.game_config.time, self.game_config.time]
 
@@ -893,6 +919,7 @@ Ecb.engine_move = EngineMove()
 Ecb.piece_promotion = PiecePromotion()
 
 if __name__ == "__main__":
+    logging.basicConfig()
     driver = EcbDriver()
     ecb = Ecb(driver, '/home/root/stockfish', '/home/root/ProDeo-3200.bin')
     ecb.handle_events()
