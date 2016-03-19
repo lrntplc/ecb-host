@@ -85,6 +85,8 @@ Event.engine_move_ended = Event("engine piece was moved")
 Event.promotion_started = Event("piece promotion started")
 Event.promotion_ended = Event("piece promotion ended")
 
+Event.pondering_finished = Event("engine finished pondering")
+
 
 class StateMachine(object):
     def __init__(self, initial_state):
@@ -285,56 +287,6 @@ class Game(State):
 
         return legal_moves
 
-    def _engine_go(self, ecb):
-        def engine_on_go_finished(command):
-            ecb.bestmove, ecb.pondermove = command.result()
-            if ecb.pondermove is not None:
-                print("bestmove move: %s, ponder: %s" %
-                      (ecb.bestmove.uci(), ecb.pondermove.uci()))
-            else:
-                print("bestmove move: %s" % ecb.bestmove.uci())
-
-            ecb.event_queue.put((Event.engine_move_started,
-                                 (ecb.bestmove, ecb.pondermove)))
-
-        def opening_book_find():
-            #                       EASY       MEDIUM        HARD
-            weight_proportions = [(0, 0.33), (0.33, 0.66), (0.66, 1)]
-            moves = list(ecb.opening_book.find_all(ecb.board))
-
-            if not len(moves):
-                return False
-
-            max_available_weight = moves[0].weight
-            min_prop, max_prop = weight_proportions[ecb.game_config.level - 1]
-            min_weight = min_prop * max_available_weight
-            max_weight = max_prop * max_available_weight
-
-            exclude_moves = []
-            for entry in moves:
-                if entry.weight < min_weight and entry.weight > max_weight:
-                    exclude_moves.append(entry.move())
-
-            try:
-                entry = ecb.opening_book.choice(ecb.board,
-                                                exclude_moves=exclude_moves)
-                print("opening database move: " + entry.move().uci())
-                ecb.event_queue.put((Event.engine_move_started,
-                                     (entry.move(), None)))
-                return True
-            except IndexError:
-                return False
-
-        wtime = ecb.time[chess.WHITE]
-        btime = ecb.time[chess.BLACK]
-        wtime_msec = (wtime['min'] * 60 + wtime['sec']) * 1000
-        btime_msec = (btime['min'] * 60 + btime['sec']) * 1000
-
-        if not opening_book_find():
-            ecb.engine.position(ecb.board)
-            ecb.engine.go(wtime=wtime_msec, btime=btime_msec,
-                          async_callback=engine_on_go_finished)
-
     def run(self, ecb, event, event_data):
         print("game: " + str(event))
 
@@ -344,7 +296,7 @@ class Game(State):
             self.pondermove = None
             if ecb.board.turn == ecb.game_config.opp_color and\
                     ecb.game_config.level != GameConfig.LEVEL_DISABLED:
-                self._engine_go(ecb)
+                ecb.engine_go()
 
             ecb.driver.btn_led_on(EcbDriver.CMD_LED_START)
 
@@ -405,16 +357,26 @@ class Game(State):
 
             if ecb.board.turn == ecb.game_config.opp_color and \
                     ecb.game_config.level != GameConfig.LEVEL_DISABLED:
-                if ecb.pondering_on and move == ecb.pondermove:
+                if ecb.pondering_result is not None:
+                    ecb.pondering_result = None
+                    if move == ecb.pondermove:
+                        self.event_queue.put((Event.engine_move_started,
+                                             (ecb.pondering_result[0],
+                                              ecb.pondering_result[1])))
+                    else:
+                        ecb.engine_go()
+
+                elif ecb.pondering_on and move == ecb.pondermove:
                     print("we've got a ponderhit")
                     ecb.engine.ponderhit()
                 else:
                     if ecb.pondering_on:
                         print("we've got a ponder miss")
                         ecb.pondering_on = False
+                        ecb.engine_ignore_callback = True
                         ecb.engine.stop()
 
-                    self._engine_go(ecb)
+                    ecb.engine_go()
 
             ecb.driver.clock_start(ecb.board.turn)
 
@@ -424,6 +386,18 @@ class Game(State):
 
             ecb.game_config.mode_change()
             ecb.game_config.update_leds(ecb.driver)
+
+        if event == Event.engine_move_ended:
+            if ecb.board.is_game_over():
+                ecb.event_queue.put((Event.game_over, None))
+
+        if event == Event.pondering_finished:
+            if ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                if ecb.board.turn == ecb.game_config.opp_color:
+                    ecb.event_queue.put((Event.engine_move_started,
+                                         (event_data[0], event_data[1])))
+                else:
+                    ecb.pondering_result = event_data
 
     def next(self, event):
         if event == Event.game_start_btn:
@@ -492,6 +466,9 @@ class Move(State):
             else:
                 ecb.event_queue.put((Event.move_ended, (self.sq_to, None)))
 
+        if event == Event.pondering_finished:
+            ecb.pondering_result = event_data
+
     def next(self, event):
         if event == Event.move_ended:
             return Ecb.game
@@ -506,33 +483,6 @@ class Move(State):
 
 
 class EngineMove(State):
-    def _engine_go_ponder(self, ecb, pondermove):
-        def engine_on_go_finished(command):
-            if not ecb.pondering_on:
-                return
-
-            ecb.bestmove, ecb.pondermove = command.result()
-            if ecb.pondermove is not None:
-                print("ponder finished: bestmove: %s, ponder: %s" %
-                      (ecb.bestmove.uci(), ecb.pondermove.uci()))
-            else:
-                print("ponder finished: bestmove: %s" % ecb.bestmove.uci())
-
-            ecb.event_queue.put((Event.engine_move_started,
-                                 (ecb.bestmove, ecb.pondermove)))
-
-        wtime = ecb.time[chess.WHITE]
-        btime = ecb.time[chess.BLACK]
-        wtime_msec = (wtime['min'] * 60 + wtime['sec']) * 1000
-        btime_msec = (btime['min'] * 60 + btime['sec']) * 1000
-
-        temp_board = ecb.board.copy()
-        temp_board.push(pondermove)
-
-        ecb.engine.position(temp_board)
-        ecb.engine.go(wtime=wtime_msec, btime=btime_msec, ponder=True,
-                      async_callback=engine_on_go_finished)
-
     def _signal_promotion(self, ecb, chess_piece_type):
         promotion_led_map = {
             chess.QUEEN: EcbDriver.CMD_LED_MODE,
@@ -565,15 +515,10 @@ class EngineMove(State):
                 ecb.driver.btn_led_off(0xff)
                 self._signal_promotion(ecb, self.promotion)
 
-            if ecb.board.is_game_over():
-                ecb.event_queue.put((Event.game_over, None))
-                return
-
             if pondermove is not None and\
                     ecb.game_config.level == GameConfig.LEVEL_HARD:
-                print("activate pondering")
-                self._engine_go_ponder(ecb, pondermove)
-                ecb.pondering_on = True
+                print("activate pondering for: " + str(pondermove.uci()))
+                ecb.engine_go(pondermove)
 
             ecb.driver.clock_start(ecb.board.turn)
 
@@ -592,6 +537,9 @@ class EngineMove(State):
                     ecb.game_config.update_leds(ecb.driver)
 
                 ecb.event_queue.put((Event.engine_move_ended, None))
+
+        if event == Event.pondering_finished:
+            ecb.pondering_result = event_data
 
     def next(self, event):
         if event == Event.engine_move_ended:
@@ -664,24 +612,6 @@ class GamePause(State):
         self.timer = None
         self.paused = True
 
-    def _engine_go(self, ecb):
-        def engine_on_go_finished(command):
-            ecb.bestmove, ecb.pondermove = command.result()
-            print("bestmove move: %s, ponder: %s" %
-                  (ecb.bestmove.uci(), ecb.pondermove.uci()))
-
-            ecb.event_queue.put((Event.engine_move_started,
-                                 (ecb.bestmove, ecb.pondermove)))
-
-        wtime = ecb.time[chess.WHITE]
-        btime = ecb.time[chess.BLACK]
-        wtime_msec = (wtime['min'] * 60 + wtime['sec']) * 1000
-        btime_msec = (btime['min'] * 60 + btime['sec']) * 1000
-
-        ecb.engine.position(ecb.board)
-        ecb.engine.go(wtime=wtime_msec, btime=btime_msec,
-                      async_callback=engine_on_go_finished)
-
     def run(self, ecb, event, event_data):
         print("GamePause: " + str(event))
         if event == Event.game_start_btn:
@@ -706,7 +636,7 @@ class GamePause(State):
                     print("resuming...")
                     if ecb.board.turn == ecb.game_config.opp_color and \
                             ecb.game_config.level != GameConfig.LEVEL_DISABLED:
-                        self._engine_go(ecb)
+                        ecb.engine_go()
 
                     ecb.driver.clock_start(ecb.board.turn)
 
@@ -876,10 +806,79 @@ class Ecb(StateMachine):
         self.bestmove = None
         self.pondermove = None
         self.pondering_on = False
+        self.pondering_result = None
+        self.engine_ignore_callback = False
 
         super(Ecb, self).__init__(Ecb.idle)
 
         print("EcbFSM ready")
+
+    def engine_go(self, pondermove=None):
+        def engine_on_go_finished(command):
+            if self.engine_ignore_callback:
+                self.engine_ignore_callback = False
+                return
+
+            self.bestmove, self.pondermove = command.result()
+            if self.pondermove is not None:
+                print("bestmove move: %s, ponder: %s" %
+                      (self.bestmove.uci(), self.pondermove.uci()))
+            else:
+                print("bestmove move: %s" % self.bestmove.uci())
+
+            if self.pondering_on:
+                self.event_queue.put((Event.pondering_finished,
+                                     (self.bestmove, self.pondermove)))
+            else:
+                self.event_queue.put((Event.engine_move_started,
+                                     (self.bestmove, self.pondermove)))
+
+        def opening_book_find():
+            #                       EASY       MEDIUM        HARD
+            weight_proportions = [(0, 0.33), (0.33, 0.66), (0.66, 1)]
+            moves = list(self.opening_book.find_all(self.board))
+
+            if not len(moves):
+                return False
+
+            max_available_weight = moves[0].weight
+            min_prop, max_prop = weight_proportions[self.game_config.level - 1]
+            min_weight = min_prop * max_available_weight
+            max_weight = max_prop * max_available_weight
+
+            exclude_moves = []
+            for entry in moves:
+                if entry.weight < min_weight and entry.weight > max_weight:
+                    exclude_moves.append(entry.move())
+
+            try:
+                entry = self.opening_book.choice(self.board,
+                                                 exclude_moves=exclude_moves)
+                print("opening database move: " + entry.move().uci())
+                self.event_queue.put((Event.engine_move_started,
+                                     (entry.move(), None)))
+                return True
+            except IndexError:
+                return False
+
+        wtime = self.time[chess.WHITE]
+        btime = self.time[chess.BLACK]
+        wtime_msec = (wtime['min'] * 60 + wtime['sec']) * 1000
+        btime_msec = (btime['min'] * 60 + btime['sec']) * 1000
+
+        if not opening_book_find():
+            if pondermove is not None:
+                board = self.board.copy()
+                board.push(pondermove)
+                self.pondering_on = True
+            else:
+                board = self.board
+                self.pondering_on = False
+
+            self.engine.position(board)
+            self.engine.go(wtime=wtime_msec, btime=btime_msec,
+                           ponder=self.pondering_on,
+                           async_callback=engine_on_go_finished)
 
     def _sensors_callback(self, changed_squares):
         print("sensors callback: " + str(changed_squares))
