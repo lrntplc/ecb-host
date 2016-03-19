@@ -1,0 +1,12 @@
+[Unit]
+Description=Edison Chess Board
+
+[Service]
+Environment="HOME=/home/root"
+#User=root
+ExecStart=/home/root/start_ecb.sh
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
