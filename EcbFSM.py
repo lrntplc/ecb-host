@@ -87,6 +87,12 @@ Event.promotion_ended = Event("piece promotion ended")
 
 Event.pondering_finished = Event("engine finished pondering")
 
+Event.on_web_connect = Event("web client connected")
+Event.on_web_disconnect = Event("web client disconnected")
+Event.on_web_square_set = Event("a piece on a square has been set in web client")
+Event.on_web_square_unset = Event("a piece on a square has been unset in web client")
+Event.on_web_board_setup_done = Event("custom board setup finished")
+
 
 class StateMachine(object):
     def __init__(self, initial_state):
@@ -148,6 +154,13 @@ class Starting(State):
 
         return squares
 
+    def _sensor_map_to_squares(self, sensor_map):
+        squares = []
+        for row in range(0, 8):
+            squares += self._row_to_squares(row, sensor_map[row])
+
+        return squares
+
     def _bits_in_byte(self, byte):
         half_byte_map = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]
 
@@ -189,9 +202,13 @@ class Starting(State):
         self.ignore_sensor_events = False
         sensors_map = ecb.driver.sensors_get()
         print(str(sensors_map))
-        position_type = self._detect_position_type(sensors_map)
+        self.position_type = self._detect_position_type(sensors_map)
 
-        if position_type == self.POSITION_NEW:
+        if ecb.sio is not None and self.position_type != self.POSITION_NEW and\
+                ecb.custom_fen is None:
+            ecb.sio.emit("sensors_map", sensors_map)
+
+        if self.position_type == self.POSITION_NEW:
             unknown_squares = self._new_game_unknown_squares(sensors_map)
             if len(unknown_squares):
                 ecb.driver.leds_blink(unknown_squares)
@@ -200,9 +217,17 @@ class Starting(State):
             ecb.board = chess.Board(chess.STARTING_FEN)
         else:
             print("Custom position...")
-#            ecb.board = chess.Board("4k3/7P/8/8/8/8/p7/4K3 w - - 0 1")
-            ecb.board = chess.Board("4k3/8/8/8/8/8/8/R3K2R w - - 0 1")
-#            return
+
+            if ecb.custom_fen is not None:
+                ecb.board = chess.Board(ecb.custom_fen)
+            else:
+                self.custom_squares = self._sensor_map_to_squares(sensors_map)
+                ecb.driver.leds_blink(None, self.custom_squares)
+
+                return
+
+        if ecb.sio is not None:
+            ecb.sio.emit("start_game", ecb.board.fen())
 
         ecb.driver.leds_blink()
 
@@ -240,7 +265,30 @@ class Starting(State):
             self.ignore_sensor_events = True
             Timer(1, self._attempt_start, [ecb]).start()
 
+            if ecb.sio is not None:
+                ecb.sio.emit("setup_game")
+
         if event == Event.sensors_changed and not self.ignore_sensor_events:
+            self._attempt_start(ecb)
+
+        if event == Event.on_web_connect:
+            if ecb.sio is not None:
+                ecb.sio.emit("setup_game")
+
+                if self.position_type != self.POSITION_NEW and\
+                        ecb.custom_fen is None:
+                    ecb.sio.emit("sensors_map", ecb.driver.sensors_get())
+
+        if event == Event.on_web_square_set:
+            self.custom_squares.pop(self.custom_squares.index(event_data))
+            ecb.driver.leds_blink(None, self.custom_squares)
+
+        if event == Event.on_web_square_unset:
+            self.custom_squares.append(event_data)
+            ecb.driver.leds_blink(None, self.custom_squares)
+
+        if event == Event.on_web_board_setup_done:
+            ecb.custom_fen = event_data
             self._attempt_start(ecb)
 
     def next(self, event):
@@ -265,8 +313,13 @@ class Stopping(State):
             ecb.driver.clock_blank(EcbDriver.CLOCK_TOP)
 
             if ecb.game_config.level != GameConfig.LEVEL_DISABLED:
-                ecb.engine.quit()
-                ecb.opening_book.close()
+                if ecb.engine is not None:
+                    ecb.engine.quit()
+                if ecb.opening_book is not None:
+                    ecb.opening_book.close()
+
+            ecb.board = None
+            ecb.custom_fen = None
 
             ecb.event_queue.put((Event.game_stopped, None))
 
@@ -348,6 +401,9 @@ class Game(State):
         ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
         ecb.board.push(move)
 
+        if ecb.sio is not None:
+            ecb.sio.emit('board_update', ecb.board.fen())
+
         if ecb.board.is_game_over():
             ecb.event_queue.put((Event.game_over, None))
             return
@@ -396,6 +452,10 @@ class Game(State):
             else:
                 ecb.pondering_result = event_data
 
+    def _handle_on_web_connect(self, ecb):
+        if ecb.sio is not None:
+            ecb.sio.emit('start_game', ecb.board.fen())
+
     def run(self, ecb, event, event_data):
         print("game: " + str(event))
 
@@ -416,6 +476,9 @@ class Game(State):
 
         if event == Event.pondering_finished:
             self._handle_pondering_finished(ecb, event_data)
+
+        if event == Event.on_web_connect:
+            self._handle_on_web_connect(ecb)
 
     def next(self, event):
         if event == Event.game_start_btn:
@@ -528,6 +591,9 @@ class EngineMove(State):
             ecb.driver.clock_stop(ecb.board.turn)
             ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
             ecb.board.push(bestmove)
+
+            if ecb.sio is not None:
+                ecb.sio.emit('board_update', ecb.board.fen())
 
             if self.promotion is not None:
                 ecb.driver.btn_led_off(0xff)
@@ -802,9 +868,10 @@ class GameConfig(object):
 
 
 class Ecb(StateMachine):
-    def __init__(self, driver, path_to_engine, path_to_opening_book):
+    def __init__(self, driver, path_to_engine, path_to_opening_book, sio=None):
         self.event_queue = Queue.Queue()
         self.driver = driver
+        self.sio = sio
         self.driver.set_callbacks(self._sensors_callback,
                                   self._clock_expired_callback,
                                   self._cmd_callback)
@@ -826,6 +893,9 @@ class Ecb(StateMachine):
         self.pondering_on = False
         self.pondering_result = None
         self.engine_ignore_callback = False
+
+        self.web_client_connected = False
+        self.custom_fen = None
 
         super(Ecb, self).__init__(Ecb.idle)
 
