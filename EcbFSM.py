@@ -240,9 +240,9 @@ class Starting(State):
             ecb.engine.uci()
             skill_level = 20
             if ecb.game_config.level == GameConfig.LEVEL_EASY:
-                skill_level = 0
+                skill_level = 3
             elif ecb.game_config.level == GameConfig.LEVEL_MEDIUM:
-                skill_level = 10
+                skill_level = 11
 
             print("setting engine skill to %d." % skill_level)
             ecb.engine.setoption({
@@ -368,7 +368,7 @@ class Game(State):
                     self.from_sq = sq2
                     event_data.pop(event_data.index(event_data[1]))
 
-                ecb.event_queue.put((Event.move_ended, event_data))
+                ecb.event_queue.put((Event.move_ended, (event_data[0], None)))
 
             return
 
@@ -964,9 +964,22 @@ class Ecb(StateMachine):
                 self.pondering_on = False
 
             self.engine.position(board)
-            self.engine.go(wtime=wtime_msec, btime=btime_msec,
-                           ponder=self.pondering_on,
-                           async_callback=engine_on_go_finished)
+            if self.game_config.level == GameConfig.LEVEL_EASY:
+                self.engine.go(wtime=wtime_msec, btime=btime_msec,
+                               ponder=self.pondering_on,
+                               depth=1,
+                               movetime=40,
+                               async_callback=engine_on_go_finished)
+            elif self.game_config.level == GameConfig.LEVEL_MEDIUM:
+                self.engine.go(wtime=wtime_msec, btime=btime_msec,
+                               ponder=self.pondering_on,
+                               depth=4,
+                               movetime=200,
+                               async_callback=engine_on_go_finished)
+            else:
+                self.engine.go(wtime=wtime_msec, btime=btime_msec,
+                               ponder=self.pondering_on,
+                               async_callback=engine_on_go_finished)
 
     def _sensors_callback(self, changed_squares):
         print("sensors callback: " + str(changed_squares))
