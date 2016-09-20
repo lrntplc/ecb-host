@@ -82,7 +82,37 @@ $(document).ready(function() {
 	  game = new Chess('8/8/8/8/8/8/8/8 w - - 0 1'),
 	  statusEl = $('#status'),
 	  fenEl = $('#fen'),
+      black_castling_king = $('#cr_black_king'),
+      black_castling_queen = $('#cr_black_queen'),
+      white_castling_king = $('#cr_white_king'),
+      white_castling_queen = $('#cr_white_queen'),
+      turn_white = $('#turn_white'),
+      turn_black = $('#turn_black'),
       game_started = false;
+
+    black_castling_king.on('click', function() {
+      updateStatus();
+    });
+
+    black_castling_queen.on('click', function() {
+      updateStatus();
+    });
+
+    white_castling_king.on('click', function() {
+      updateStatus();
+    });
+
+    white_castling_queen.on('click', function() {
+      updateStatus();
+    });
+
+    turn_white.on('click', function() {
+      updateStatus();
+    });
+
+    turn_black.on('click', function() {
+      updateStatus();
+    });
 
 	// do not pick up pieces if the game is over
 	// only pick up pieces for the side to move
@@ -166,6 +196,33 @@ $(document).ready(function() {
 		  status += ', ' + moveColor + ' is in check';
 		}
 	  }
+
+      var castling = "";
+
+      if (white_castling_king.is(':checked'))
+        castling += "K";
+
+      if (white_castling_queen.is(':checked'))
+        castling += "Q";
+
+      if (black_castling_king.is(':checked'))
+        castling += "k";
+
+      if (black_castling_queen.is(':checked'))
+        castling += "q";
+
+      if (castling === "")
+        castling = "-";
+
+      if (turn_white.is(':checked'))
+        turn = ' w ';
+      else
+        turn = ' b ';
+
+      fen_str = board.fen() + turn + castling + " - 0 1";
+
+      game.clear();
+      game.load(fen_str);
 
 	  statusEl.html(status);
 	  fenEl.html(game.fen());
