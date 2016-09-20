@@ -321,7 +321,7 @@ class EcbDriver(object):
 
         self._leds_off(led_map)
 
-    def leds_blink(self, onoff_squares=None, offon_squares=None):
+    def leds_blink(self, onoff_squares=None, offon_squares=None, timeout=0.5):
         def switch_off_leftovers(old_map, new_map):
             leftover_map = [0]*8
 
@@ -360,7 +360,7 @@ class EcbDriver(object):
             return
 
         self.blink_state = 1
-        self.blink_interval = self._set_interval(self._leds_blink, 0.5)
+        self.blink_interval = self._set_interval(self._leds_blink, timeout)
 
     # Sensors API
     def sensors_start(self):
