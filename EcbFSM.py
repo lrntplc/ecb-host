@@ -6,6 +6,7 @@ import chess.uci
 import chess.polyglot
 import Queue
 from threading import Timer
+import struct
 import logging
 
 
@@ -72,7 +73,7 @@ Event.game_over = Event("game over")
 Event.game_force_stop = Event("start button was pressed twice")
 Event.game_resume = Event("game resumed")
 
-Event.stray_events = Event("too many square events received")
+Event.invalid_squares = Event("invalid squares")
 Event.error_end = Event("error condition has ended")
 
 Event.move_started = Event("move started")
@@ -144,23 +145,6 @@ class Starting(State):
     POSITION_NEW = 0
     POSITION_CUSTOM = 1
 
-    def _row_to_squares(self, row, val):
-        columns = "abcdefgh"
-        squares = []
-
-        for i in range(0, 8):
-            if (val & (1 << i)):
-                squares.append("%s%d" % (columns[i], row + 1))
-
-        return squares
-
-    def _sensor_map_to_squares(self, sensor_map):
-        squares = []
-        for row in range(0, 8):
-            squares += self._row_to_squares(row, sensor_map[row])
-
-        return squares
-
     def _bits_in_byte(self, byte):
         half_byte_map = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]
 
@@ -186,7 +170,7 @@ class Starting(State):
 
         return self.POSITION_CUSTOM
 
-    def _new_game_unknown_squares(self, sensors_map):
+    def _new_game_unknown_squares(self, ecb, sensors_map):
         initial_pos_rows = [0, 1, 6, 7]
         unknown_squares = []
 
@@ -194,7 +178,7 @@ class Starting(State):
             row_pos = initial_pos_rows[i]
             row_val = ~(sensors_map[initial_pos_rows[i]])
 
-            unknown_squares += self._row_to_squares(row_pos, row_val)
+            unknown_squares += ecb.row_to_squares(row_pos, row_val)
 
         return unknown_squares
 
@@ -209,7 +193,7 @@ class Starting(State):
             ecb.sio.emit("sensors_map", sensors_map)
 
         if self.position_type == self.POSITION_NEW:
-            unknown_squares = self._new_game_unknown_squares(sensors_map)
+            unknown_squares = self._new_game_unknown_squares(ecb, sensors_map)
             if len(unknown_squares):
                 ecb.driver.leds_blink(unknown_squares)
                 return
@@ -221,7 +205,7 @@ class Starting(State):
             if ecb.custom_fen is not None:
                 ecb.board = chess.Board(ecb.custom_fen)
             else:
-                self.custom_squares = self._sensor_map_to_squares(sensors_map)
+                self.custom_squares = ecb.sensor_map_to_squares(sensors_map)
                 ecb.driver.leds_blink(None, self.custom_squares)
 
                 return
@@ -351,25 +335,8 @@ class Game(State):
         ecb.driver.btn_led_on(EcbDriver.CMD_LED_START)
 
     def _handle_sensors_changed(self, ecb, event_data):
-        if len(event_data) > 2:
-            ecb.event_queue.put((Event.stray_events, event_data))
-            return
-
-        if len(event_data) == 2:
-            sq1 = chess.SQUARE_NAMES.index(event_data[0])
-            sq2 = chess.SQUARE_NAMES.index(event_data[1])
-            if ecb.board.piece_at(sq1) and ecb.board.piece_at(sq2):
-                ecb.event_queue.put((Event.stray_events, event_data))
-            else:
-                if ecb.board.piece_at(sq1):
-                    self.from_sq = sq1
-                    event_data.pop(event_data.index(event_data[0]))
-                else:
-                    self.from_sq = sq2
-                    event_data.pop(event_data.index(event_data[1]))
-
-                ecb.event_queue.put((Event.move_ended, (event_data[0], None)))
-
+        if len(event_data) != 1:
+            ecb.event_queue.put((Event.invalid_squares, event_data))
             return
 
         # ignore events from engine pieces
@@ -378,8 +345,14 @@ class Game(State):
             return
 
         self.from_sq = chess.SQUARE_NAMES.index(event_data[0])
+
+        # we should have an empty square to detect a move start
+        if ecb.chessman_detected(event_data[0]):
+            return
+
         legal_moves = self._get_legal_moves(ecb.board, event_data[0])
 
+        # of piece cannot be moved, just return
         if len(legal_moves) == 0:
             return
 
@@ -413,9 +386,9 @@ class Game(State):
             if ecb.pondering_result is not None:
                 ecb.pondering_result = None
                 if move == ecb.pondermove:
-                    self.event_queue.put((Event.engine_move_started,
-                                         (ecb.pondering_result[0],
-                                          ecb.pondering_result[1])))
+                    ecb.event_queue.put((Event.engine_move_started,
+                                        (ecb.pondering_result[0],
+                                         ecb.pondering_result[1])))
                 else:
                     ecb.engine_go()
 
@@ -432,6 +405,10 @@ class Game(State):
                 ecb.engine_go()
 
         ecb.driver.clock_start(ecb.board.turn)
+
+        invalid_squares_list = ecb.validate_board()
+        if (len(invalid_squares_list)):
+            ecb.event_queue.put((Event.invalid_squares, invalid_squares_list))
 
     def _handle_game_config_btn(self, ecb, event_data):
         if not event_data & EcbDriver.CMD_BTN_MODE:
@@ -451,6 +428,12 @@ class Game(State):
                                      (event_data[0], event_data[1])))
             else:
                 ecb.pondering_result = event_data
+
+    def _handle_error_end(self, ecb, event_data):
+        # In case the engine finished while we were in an error condition,
+        # re-send the event.
+        if event_data is not None:
+            ecb.event_queue.put((Event.engine_move_started, event_data))
 
     def _handle_on_web_connect(self, ecb):
         if ecb.sio is not None:
@@ -477,6 +460,9 @@ class Game(State):
         if event == Event.pondering_finished:
             self._handle_pondering_finished(ecb, event_data)
 
+        if event == Event.error_end:
+            self._handle_error_end(ecb, event_data)
+
         if event == Event.on_web_connect:
             self._handle_on_web_connect(ecb)
 
@@ -489,7 +475,7 @@ class Game(State):
             return Ecb.engine_move
         elif event == Event.clock_expired or event == Event.game_over:
             return Ecb.game_end
-        elif event == Event.stray_events:
+        elif event == Event.invalid_squares:
             return Ecb.game_error
 
         return Ecb.game
@@ -509,43 +495,67 @@ class Move(State):
 
         return False
 
-    def run(self, ecb, event, event_data):
-        print("move: " + str(event))
-        if event == Event.move_started:
-            self.sq_from = event_data['from'][0]
-            self.legal_moves = event_data['legal_moves']
+    def _handle_move_started(self, ecb, event_data):
+        self.sq_from = event_data['from'][0]
+        self.legal_moves = event_data['legal_moves']
 
-            ecb.driver.leds_blink([self.sq_from])
+        ecb.driver.leds_blink([self.sq_from])
 
-            if ecb.game_config.mode == GameConfig.MODE_LEARN:
-                ecb.driver.leds_on(self.legal_moves)
+        if ecb.game_config.mode == GameConfig.MODE_LEARN:
+            ecb.driver.leds_on(self.legal_moves)
 
-        if event == Event.sensors_changed:
-            if len(event_data) != 1:
-                ecb.event_queue.put((Event.stray_events, event_data))
-                return
-
-            if event_data[0] != self.sq_from and\
-                    event_data[0] not in self.legal_moves:
-                return
-
-            if self.sq_from == event_data[0]:
+    def _handle_sensors_changed(self, ecb, event_data):
+        def debounce_move():
+            if self.sq_from == self.sq_to:
                 ecb.event_queue.put((Event.move_aborted, None))
                 ecb.driver.leds_off(self.legal_moves)
                 ecb.driver.leds_blink()
                 return
 
-            if ecb.game_config.mode == GameConfig.MODE_LEARN:
-                ecb.driver.leds_off(self.legal_moves)
-
+            ecb.driver.leds_off(self.legal_moves)
             ecb.driver.leds_blink()
-
-            self.sq_to = event_data[0]
 
             if self._is_promotion(ecb, self.sq_from, self.sq_to):
                 ecb.event_queue.put((Event.promotion_started, self.sq_to))
             else:
                 ecb.event_queue.put((Event.move_ended, (self.sq_to, None)))
+
+        try:
+            self.timer.cancel()
+        except AttributeError:
+            pass
+
+        if len(event_data) != 1:
+            ecb.event_queue.put((Event.invalid_squares, event_data))
+            return
+
+        if event_data[0] != self.sq_from and\
+                event_data[0] not in self.legal_moves:
+            return
+
+        try:
+            ecb.driver.leds_off([self.sq_to])
+        except AttributeError:
+            pass
+
+        self.sq_to = event_data[0]
+
+        if not ecb.chessman_detected(self.sq_to):
+            return
+
+        ecb.driver.leds_on([self.sq_to])
+
+        self.timer = Timer(1, debounce_move)
+        self.timer.start()
+
+    def run(self, ecb, event, event_data):
+        print("move: " + str(event))
+
+        if event == Event.move_started:
+            self._handle_move_started(ecb, event_data)
+
+        if event == Event.sensors_changed:
+            self._handle_sensors_changed(ecb, event_data)
 
         if event == Event.pondering_finished:
             ecb.pondering_result = event_data
@@ -577,50 +587,60 @@ class EngineMove(State):
                                            promotion_led_map[chess_piece_type])
         self.promotion_interval.start()
 
+    def _handle_engine_move_started(self, ecb, event_data):
+        bestmove = event_data[0]
+        pondermove = event_data[1]
+
+        self.from_sq = chess.SQUARE_NAMES[bestmove.from_square]
+        self.to_sq = chess.SQUARE_NAMES[bestmove.to_square]
+        self.promotion = bestmove.promotion
+
+        ecb.driver.leds_blink([self.from_sq], [self.to_sq])
+        ecb.driver.clock_stop(ecb.board.turn)
+        ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+        ecb.board.push(bestmove)
+
+        if ecb.sio is not None:
+            ecb.sio.emit('board_update', ecb.board.fen())
+
+        if self.promotion is not None:
+            ecb.driver.btn_led_off(0xff)
+            self._signal_promotion(ecb, self.promotion)
+
+        if pondermove is not None and\
+                ecb.game_config.level == GameConfig.LEVEL_HARD:
+            print("activate pondering for: " + str(pondermove.uci()))
+            ecb.engine_go(pondermove)
+
+        ecb.driver.clock_start(ecb.board.turn)
+
+    def _handle_sensors_changed(self, ecb, event_data):
+        if len(event_data) != 1:
+            ecb.event_queue.put((Event.invalid_squares, event_data))
+            return
+
+        if event_data[0] == self.from_sq:
+            ecb.driver.leds_blink(None, [self.to_sq])
+            self.from_sq = ''
+        elif event_data[0] == self.to_sq and self.from_sq == '':
+            ecb.driver.leds_blink()
+
+            if self.promotion is not None:
+                self.promotion_interval.cancel()
+                ecb.game_config.update_leds(ecb.driver)
+
+            ecb.event_queue.put((Event.engine_move_ended, None))
+            invalid_squares = ecb.validate_board()
+            if (len(invalid_squares)):
+                ecb.event_queue.put((Event.invalid_squares, event_data))
+
     def run(self, ecb, event, event_data):
         print("EngineMove: " + str(event))
         if event == Event.engine_move_started:
-            bestmove = event_data[0]
-            pondermove = event_data[1]
-
-            self.from_sq = chess.SQUARE_NAMES[bestmove.from_square]
-            self.to_sq = chess.SQUARE_NAMES[bestmove.to_square]
-            self.promotion = bestmove.promotion
-
-            ecb.driver.leds_blink([self.from_sq], [self.to_sq])
-            ecb.driver.clock_stop(ecb.board.turn)
-            ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
-            ecb.board.push(bestmove)
-
-            if ecb.sio is not None:
-                ecb.sio.emit('board_update', ecb.board.fen())
-
-            if self.promotion is not None:
-                ecb.driver.btn_led_off(0xff)
-                self._signal_promotion(ecb, self.promotion)
-
-            if pondermove is not None and\
-                    ecb.game_config.level == GameConfig.LEVEL_HARD:
-                print("activate pondering for: " + str(pondermove.uci()))
-                ecb.engine_go(pondermove)
-
-            ecb.driver.clock_start(ecb.board.turn)
+            self._handle_engine_move_started(ecb, event_data)
 
         if event == Event.sensors_changed:
-            if len(event_data) != 1:
-                raise Exception('TODO: handle multiple pieces moved')
-
-            if event_data[0] == self.from_sq:
-                ecb.driver.leds_blink(None, [self.to_sq])
-                self.from_sq = ''
-            elif event_data[0] == self.to_sq and self.from_sq == '':
-                ecb.driver.leds_blink()
-
-                if self.promotion is not None:
-                    self.promotion_interval.cancel()
-                    ecb.game_config.update_leds(ecb.driver)
-
-                ecb.event_queue.put((Event.engine_move_ended, None))
+            self._handle_sensors_changed(ecb, event_data)
 
         if event == Event.pondering_finished:
             ecb.pondering_result = event_data
@@ -661,24 +681,45 @@ class GameEnd(State):
 
 
 class GameError(State):
+    def __init__(self):
+        self.engine_move = None
+
+    def _handle_invalid_squares(self, ecb, event_data):
+        self.sq_list = event_data
+        ecb.driver.leds_blink(event_data, timeout=1)
+
+    def _handle_sensors_changed(self, ecb, event_data):
+        for sq in event_data:
+            if sq in self.sq_list:
+                self.sq_list.pop(self.sq_list.index(sq))
+            else:
+                self.sq_list.append(sq)
+
+        ecb.driver.leds_blink(self.sq_list, timeout=1)
+
+        if not len(self.sq_list):
+            invalid_squares = ecb.validate_board()
+            if len(invalid_squares):
+                self.sq_list = invalid_squares
+                return
+
+            ecb.event_queue.put((Event.error_end, self.engine_move))
+            self.engine_move = None
+
+    def _handle_engine_move_started(self, ecb, event_data):
+        # save the engine move until error condition is over
+        self.engine_move = event_data
+
     def run(self, ecb, event, event_data):
         print("GameError: " + str(event))
-        if event == Event.stray_events:
-            self.sq_list = event_data
-
-            ecb.driver.leds_blink(event_data)
+        if event == Event.invalid_squares:
+            self._handle_invalid_squares(ecb, event_data)
 
         if event == Event.sensors_changed:
-            for sq in event_data:
-                if sq in self.sq_list:
-                    self.sq_list.pop(self.sq_list.index(sq))
-                else:
-                    self.sq_list.append(sq)
+            self._handle_sensors_changed(ecb, event_data)
 
-            ecb.driver.leds_blink(self.sq_list)
-
-            if not len(self.sq_list):
-                ecb.event_queue.put((Event.error_end, None))
+        if event == Event.engine_move_started:
+            self._handle_engine_move_started(ecb, event_data)
 
     def next(self, event):
         if event == Event.error_end:
@@ -696,55 +737,59 @@ class GamePause(State):
         self.timer = None
         self.paused = True
 
-    def run(self, ecb, event, event_data):
-        print("GamePause: " + str(event))
-        if event == Event.game_start_btn:
-            if self.timer is None:
-                if not self.paused:
-                    print("pausing....")
-                    ecb.driver.clock_stop(ecb.board.turn)
-                    ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+    def _handle_game_start_btn(self, ecb):
+        if self.timer is None:
+            if not self.paused:
+                print("pausing....")
+                ecb.driver.clock_stop(ecb.board.turn)
+                ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
 
-                    if ecb.board.turn == ecb.game_config.opp_color and \
-                            ecb.game_config.level != GameConfig.LEVEL_DISABLED:
-                        ecb.engine.stop()
+                if ecb.board.turn == ecb.game_config.opp_color and \
+                        ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                    ecb.engine.stop()
 
-                    self.led_blink = Interval(1,
-                                              ecb.driver.btn_led_toggle,
-                                              EcbDriver.CMD_LED_START)
-                    self.led_blink.start()
+                self.led_blink = Interval(1,
+                                          ecb.driver.btn_led_toggle,
+                                          EcbDriver.CMD_LED_START)
+                self.led_blink.start()
 
-                    self.timer = Timer(3, self._can_stop_timeout)
-                    self.timer.start()
-                else:
-                    print("resuming...")
-                    if ecb.board.turn == ecb.game_config.opp_color and \
-                            ecb.game_config.level != GameConfig.LEVEL_DISABLED:
-                        ecb.engine_go()
+                self.timer = Timer(3, self._can_stop_timeout)
+                self.timer.start()
+            else:
+                print("resuming...")
+                if ecb.board.turn == ecb.game_config.opp_color and \
+                        ecb.game_config.level != GameConfig.LEVEL_DISABLED:
+                    ecb.engine_go()
 
-                    ecb.driver.clock_start(ecb.board.turn)
+                ecb.driver.clock_start(ecb.board.turn)
 
-                    ecb.event_queue.put((Event.game_resume, None))
-
-                    if self.led_blink is not None:
-                        self.led_blink.cancel()
-
-                    ecb.driver.btn_led_on(EcbDriver.CMD_LED_START)
-
-                    self.paused = False
-
-            else:  # button was pressed the second time before the timer expire
-                print("stopping...")
-                ecb.event_queue.put((Event.game_force_stop, None))
+                ecb.event_queue.put((Event.game_resume, None))
 
                 if self.led_blink is not None:
                     self.led_blink.cancel()
 
-                if self.timer is not None:
-                    self.timer.cancel()
-                    self.timer = None
+                ecb.driver.btn_led_on(EcbDriver.CMD_LED_START)
 
                 self.paused = False
+
+        else:  # button was pressed the second time before the timer expire
+            print("stopping...")
+            ecb.event_queue.put((Event.game_force_stop, None))
+
+            if self.led_blink is not None:
+                self.led_blink.cancel()
+
+            if self.timer is not None:
+                self.timer.cancel()
+                self.timer = None
+
+            self.paused = False
+
+    def run(self, ecb, event, event_data):
+        print("GamePause: " + str(event))
+
+        if event == Event.game_start_btn:
+            self._handle_game_start_btn(ecb)
 
     def next(self, event):
         if event == Event.game_force_stop:
@@ -756,38 +801,44 @@ class GamePause(State):
 
 
 class PiecePromotion(State):
+    def _handle_promotion_started(self, ecb, event_data):
+        self.to_sq = event_data
+
+        led_mask = EcbDriver.CMD_LED_START |\
+            EcbDriver.CMD_LED_MODE |\
+            EcbDriver.CMD_LED_OPP_LEVEL0 |\
+            EcbDriver.CMD_LED_OPP_COLOR
+
+        ecb.driver.btn_led_off(0xff)
+        self.blink_interval = Interval(0.5,
+                                       ecb.driver.btn_led_toggle,
+                                       led_mask)
+        self.blink_interval.start()
+
+    def _handle_buttons(self, ecb, event_data):
+        if event_data is None:
+            promotion = chess.KNIGHT
+        elif event_data & EcbDriver.CMD_BTN_GAME_TIME:
+            pass
+        elif event_data & EcbDriver.CMD_BTN_MODE:
+            promotion = chess.QUEEN
+        elif event_data & EcbDriver.CMD_BTN_OPP_LEVEL:
+            promotion = chess.ROOK
+        else:
+            promotion = chess.BISHOP
+
+        self.blink_interval.cancel()
+        ecb.game_config.update_leds(ecb.driver)
+
+        ecb.event_queue.put((Event.move_ended, (self.to_sq, promotion)))
+
     def run(self, ecb, event, event_data):
         print("PiecePromotion: " + str(event))
         if event == Event.promotion_started:
-            self.to_sq = event_data
-
-            led_mask = EcbDriver.CMD_LED_START |\
-                EcbDriver.CMD_LED_MODE |\
-                EcbDriver.CMD_LED_OPP_LEVEL0 |\
-                EcbDriver.CMD_LED_OPP_COLOR
-
-            ecb.driver.btn_led_off(0xff)
-            self.blink_interval = Interval(0.5,
-                                           ecb.driver.btn_led_toggle,
-                                           led_mask)
-            self.blink_interval.start()
+            self._handle_promotion_started(ecb, event_data)
 
         if event == Event.game_config_btn or event == Event.game_start_btn:
-            if event_data is None:
-                promotion = chess.KNIGHT
-            elif event_data & EcbDriver.CMD_BTN_GAME_TIME:
-                pass
-            elif event_data & EcbDriver.CMD_BTN_MODE:
-                promotion = chess.QUEEN
-            elif event_data & EcbDriver.CMD_BTN_OPP_LEVEL:
-                promotion = chess.ROOK
-            else:
-                promotion = chess.BISHOP
-
-            self.blink_interval.cancel()
-            ecb.game_config.update_leds(ecb.driver)
-
-            ecb.event_queue.put((Event.move_ended, (self.to_sq, promotion)))
+            self._handle_buttons(ecb, event_data)
 
     def next(self, event):
         if event == Event.move_ended:
@@ -814,7 +865,7 @@ class GameConfig(object):
 
     def __init__(self):
         self.mode = GameConfig.MODE_LEARN
-        self.level = GameConfig.LEVEL_HARD
+        self.level = GameConfig.LEVEL_DISABLED
         self.opp_color = chess.BLACK
         self.time = {'min': 45, 'sec': 0}
 
@@ -980,6 +1031,61 @@ class Ecb(StateMachine):
                 self.engine.go(wtime=wtime_msec, btime=btime_msec,
                                ponder=self.pondering_on,
                                async_callback=engine_on_go_finished)
+
+    def row_to_squares(self, row, val):
+        columns = "abcdefgh"
+        squares = []
+
+        for i in range(0, 8):
+            if (val & (1 << i)):
+                squares.append("%s%d" % (columns[i], row + 1))
+
+        return squares
+
+    def sensor_map_to_squares(self, sensor_map):
+        squares = []
+        for row in range(0, 8):
+            squares += self.row_to_squares(row, sensor_map[row])
+
+        return squares
+
+    # returns True if sensor detects a chessman
+    def chessman_detected(self, square):
+        on_squares = self.sensor_map_to_squares(self.driver.sensors_get())
+
+        if square in on_squares:
+            return True
+
+        return False
+
+    def validate_board(self):
+        if self.board is None:
+            return
+
+        piece_types = [chess.PAWN, chess.ROOK, chess.KNIGHT, chess.BISHOP, chess.QUEEN, chess.KING]
+        piece_colors = [chess.WHITE, chess.BLACK]
+
+        board_map = 0
+
+        for pc in piece_colors:
+            for pt in piece_types:
+                board_map |= int(self.board.pieces(pt, pc))
+
+        # convert to list
+        board_map = struct.unpack('8B', struct.pack('Q', board_map))
+
+        # get the sensor map
+        sensors_map = self.driver.sensors_get()
+
+        # compare the two lists and extract a list of squares that don't match
+
+        unmatching_squares = []
+        for row in range(0, 8):
+            row_changes = sensors_map[row] ^ board_map[row]
+
+            unmatching_squares += self.row_to_squares(row, row_changes)
+
+        return unmatching_squares
 
     def _sensors_callback(self, changed_squares):
         print("sensors callback: " + str(changed_squares))
