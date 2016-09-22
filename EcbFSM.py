@@ -222,11 +222,11 @@ class Starting(State):
             ecb.info_handler = MyHandler()
             ecb.engine.info_handlers.append(ecb.info_handler)
             ecb.engine.uci()
-            skill_level = 20
-            if ecb.game_config.level == GameConfig.LEVEL_EASY:
-                skill_level = 3
-            elif ecb.game_config.level == GameConfig.LEVEL_MEDIUM:
-                skill_level = 11
+
+            if ecb.game_config.level < GameConfig.LEVEL_7:
+                skill_level = ecb.ENGINE_SETTINGS[ecb.game_config.level - 1]['skill']
+            else:
+                skill_level = 20
 
             print("setting engine skill to %d." % skill_level)
             ecb.engine.setoption({
@@ -608,7 +608,7 @@ class EngineMove(State):
             self._signal_promotion(ecb, self.promotion)
 
         if pondermove is not None and\
-                ecb.game_config.level == GameConfig.LEVEL_HARD:
+                ecb.game_config.level == GameConfig.LEVEL_7:
             print("activate pondering for: " + str(pondermove.uci()))
             ecb.engine_go(pondermove)
 
@@ -852,15 +852,23 @@ class GameConfig(object):
     MODE_LEARN = 1
 
     LEVEL_DISABLED = 0
-    LEVEL_EASY = 1
-    LEVEL_MEDIUM = 2
-    LEVEL_HARD = 3
+    LEVEL_1 = 1
+    LEVEL_2 = 2
+    LEVEL_3 = 3
+    LEVEL_4 = 4
+    LEVEL_5 = 5
+    LEVEL_6 = 6
+    LEVEL_7 = 7
 
     LEVEL_LED_MAP = [
         [0, 0, 0],  # LEVEL_DISABLED
-        [1, 0, 0],  # LEVEL_EASY
-        [0, 1, 0],  # LEVEL_MEDIUM
-        [0, 0, 1],  # LEVEL_HARD
+        [1, 0, 0],  # LEVEL_1
+        [0, 1, 0],  # LEVEL_2
+        [1, 1, 0],  # LEVEL_3
+        [0, 0, 1],  # LEVEL_4
+        [1, 0, 1],  # LEVEL_5
+        [0, 1, 1],  # LEVEL_6
+        [1, 1, 1],  # LEVEL_7
     ]
 
     def __init__(self):
@@ -891,7 +899,7 @@ class GameConfig(object):
             self.time['min'] -= step
 
     def level_change(self):
-        self.level = (self.level + 1) & 0x3
+        self.level = (self.level + 1) & 0x7
 
     def update_clocks(self, driver):
         if self.time['min']:
@@ -919,6 +927,16 @@ class GameConfig(object):
 
 
 class Ecb(StateMachine):
+    # engine settings for levels 1-6
+    ENGINE_SETTINGS = [
+        {'skill': 0, 'depth': 1, 'movetime': 30},    # LEVEL 1
+        {'skill': 3, 'depth': 1, 'movetime': 50},    # LEVEL 2
+        {'skill': 6, 'depth': 2, 'movetime': 100},   # LEVEL 3
+        {'skill': 9, 'depth': 3, 'movetime': 150},   # LEVEL 4
+        {'skill': 11, 'depth': 4, 'movetime': 200},  # LEVEL 5
+        {'skill': 17, 'depth': 8, 'movetime': 300},  # LEVEL 6
+    ]
+
     def __init__(self, driver, path_to_engine, path_to_opening_book, sio=None):
         self.event_queue = Queue.Queue()
         self.driver = driver
@@ -953,15 +971,17 @@ class Ecb(StateMachine):
         print("EcbFSM ready")
 
     def _opening_book_find(self):
-        #                       EASY       MEDIUM        HARD
+        #     LEVELS             1-3          4-6          7
         weight_proportions = [(0, 0.33), (0.33, 0.66), (0.66, 1)]
+        level_to_weight_index = [0, 0, 0, 0, 1, 1, 1, 2]
         moves = list(self.opening_book.find_all(self.board))
 
         if not len(moves):
             return False
 
         max_available_weight = moves[0].weight
-        min_prop, max_prop = weight_proportions[self.game_config.level - 1]
+        weight_index = level_to_weight_index[self.game_config.level]
+        min_prop, max_prop = weight_proportions[weight_index]
         min_weight = min_prop * max_available_weight
         max_weight = max_prop * max_available_weight
 
@@ -1015,19 +1035,16 @@ class Ecb(StateMachine):
                 self.pondering_on = False
 
             self.engine.position(board)
-            if self.game_config.level == GameConfig.LEVEL_EASY:
+
+            if self.game_config.level < GameConfig.LEVEL_7:
+                depth = self.ENGINE_SETTINGS[self.game_config.level - 1]['depth']
+                movetime = self.ENGINE_SETTINGS[self.game_config.level - 1]['movetime']
+
                 self.engine.go(wtime=wtime_msec, btime=btime_msec,
                                ponder=self.pondering_on,
-                               depth=1,
-                               movetime=40,
+                               depth=depth, movetime=movetime,
                                async_callback=engine_on_go_finished)
-            elif self.game_config.level == GameConfig.LEVEL_MEDIUM:
-                self.engine.go(wtime=wtime_msec, btime=btime_msec,
-                               ponder=self.pondering_on,
-                               depth=4,
-                               movetime=200,
-                               async_callback=engine_on_go_finished)
-            else:
+            elif self.game_config.level == GameConfig.LEVEL_7:
                 self.engine.go(wtime=wtime_msec, btime=btime_msec,
                                ponder=self.pondering_on,
                                async_callback=engine_on_go_finished)
