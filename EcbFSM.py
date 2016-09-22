@@ -291,10 +291,12 @@ class Stopping(State):
             ecb.driver.sensors_stop()
             ecb.driver.btn_led_off(EcbDriver.CMD_LED_START)
             ecb.driver.leds_blink()
-            ecb.driver.clock_stop(EcbDriver.CLOCK_BOTTOM)
-            ecb.driver.clock_stop(EcbDriver.CLOCK_TOP)
-            ecb.driver.clock_blank(EcbDriver.CLOCK_BOTTOM)
-            ecb.driver.clock_blank(EcbDriver.CLOCK_TOP)
+
+            if ecb.game_config.use_time_control():
+                ecb.driver.clock_stop(EcbDriver.CLOCK_BOTTOM)
+                ecb.driver.clock_stop(EcbDriver.CLOCK_TOP)
+                ecb.driver.clock_blank(EcbDriver.CLOCK_BOTTOM)
+                ecb.driver.clock_blank(EcbDriver.CLOCK_TOP)
 
             if ecb.game_config.level != GameConfig.LEVEL_DISABLED:
                 if ecb.engine is not None:
@@ -325,7 +327,8 @@ class Game(State):
         return legal_moves
 
     def _handle_game_started(self, ecb, event_data):
-        ecb.driver.clock_start(ecb.board.turn)
+        if ecb.game_config.use_time_control():
+            ecb.driver.clock_start(ecb.board.turn)
 
         self.pondermove = None
         if ecb.board.turn == ecb.game_config.opp_color and\
@@ -370,8 +373,10 @@ class Game(State):
                           to_square=to_sq,
                           promotion=promotion)
 
-        ecb.driver.clock_stop(ecb.board.turn)
-        ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+        if ecb.game_config.use_time_control():
+            ecb.driver.clock_stop(ecb.board.turn)
+            ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+
         ecb.board.push(move)
 
         if ecb.sio is not None:
@@ -404,7 +409,8 @@ class Game(State):
 
                 ecb.engine_go()
 
-        ecb.driver.clock_start(ecb.board.turn)
+        if ecb.game_config.use_time_control():
+            ecb.driver.clock_start(ecb.board.turn)
 
         invalid_squares_list = ecb.validate_board()
         if (len(invalid_squares_list)):
@@ -596,8 +602,11 @@ class EngineMove(State):
         self.promotion = bestmove.promotion
 
         ecb.driver.leds_blink([self.from_sq], [self.to_sq])
-        ecb.driver.clock_stop(ecb.board.turn)
-        ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+
+        if ecb.game_config.use_time_control():
+            ecb.driver.clock_stop(ecb.board.turn)
+            ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+
         ecb.board.push(bestmove)
 
         if ecb.sio is not None:
@@ -612,7 +621,8 @@ class EngineMove(State):
             print("activate pondering for: " + str(pondermove.uci()))
             ecb.engine_go(pondermove)
 
-        ecb.driver.clock_start(ecb.board.turn)
+        if ecb.game_config.use_time_control():
+            ecb.driver.clock_start(ecb.board.turn)
 
     def _handle_sensors_changed(self, ecb, event_data):
         if len(event_data) != 1:
@@ -741,8 +751,9 @@ class GamePause(State):
         if self.timer is None:
             if not self.paused:
                 print("pausing....")
-                ecb.driver.clock_stop(ecb.board.turn)
-                ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+                if ecb.game_config.use_time_control():
+                    ecb.driver.clock_stop(ecb.board.turn)
+                    ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
 
                 if ecb.board.turn == ecb.game_config.opp_color and \
                         ecb.game_config.level != GameConfig.LEVEL_DISABLED:
@@ -761,7 +772,8 @@ class GamePause(State):
                         ecb.game_config.level != GameConfig.LEVEL_DISABLED:
                     ecb.engine_go()
 
-                ecb.driver.clock_start(ecb.board.turn)
+                if ecb.game_config.use_time_control():
+                    ecb.driver.clock_start(ecb.board.turn)
 
                 ecb.event_queue.put((Event.game_resume, None))
 
@@ -876,6 +888,7 @@ class GameConfig(object):
         self.level = GameConfig.LEVEL_DISABLED
         self.opp_color = chess.BLACK
         self.time = {'min': 45, 'sec': 0}
+        self.time_controlled = True
 
     def mode_change(self):
         self.mode ^= 1
@@ -902,12 +915,18 @@ class GameConfig(object):
         self.level = (self.level + 1) & 0x7
 
     def update_clocks(self, driver):
-        if self.time['min']:
-            driver.clock_set(EcbDriver.CLOCK_BOTTOM, self.time['min'], 0)
-            driver.clock_set(EcbDriver.CLOCK_TOP, self.time['min'], 0)
-        else:
+        driver.clock_set(EcbDriver.CLOCK_BOTTOM, self.time['min'], 0)
+        driver.clock_set(EcbDriver.CLOCK_TOP, self.time['min'], 0)
+
+        if self.time['min'] == 0:
             driver.clock_blank(EcbDriver.CLOCK_BOTTOM)
             driver.clock_blank(EcbDriver.CLOCK_TOP)
+
+            self.time_controlled = False
+
+            return
+
+        self.time_controlled = True
 
     def update_leds(self, driver):
         mode_cmd = [driver.btn_led_off, driver.btn_led_on][self.mode]
@@ -924,6 +943,9 @@ class GameConfig(object):
     def update(self, driver):
         self.update_clocks(driver)
         self.update_leds(driver)
+
+    def use_time_control(self):
+        return self.time_controlled
 
 
 class Ecb(StateMachine):
@@ -1020,10 +1042,15 @@ class Ecb(StateMachine):
                 self.event_queue.put((Event.engine_move_started,
                                      (self.bestmove, self.pondermove)))
 
-        wtime = self.time[chess.WHITE]
-        btime = self.time[chess.BLACK]
-        wtime_msec = (wtime['min'] * 60 + wtime['sec']) * 1000
-        btime_msec = (btime['min'] * 60 + btime['sec']) * 1000
+        if self.game_config.use_time_control():
+            wtime = self.time[chess.WHITE]
+            btime = self.time[chess.BLACK]
+            wtime_msec = (wtime['min'] * 60 + wtime['sec']) * 1000
+            btime_msec = (btime['min'] * 60 + btime['sec']) * 1000
+        else:
+            # always use 90 minutes
+            wtime_msec = 90 * 60 * 1000
+            btime_msec = 90 * 60 * 1000
 
         if not self._opening_book_find():
             if pondermove is not None:
