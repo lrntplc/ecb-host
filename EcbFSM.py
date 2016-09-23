@@ -295,8 +295,11 @@ class Stopping(State):
             if ecb.game_config.use_time_control():
                 ecb.driver.clock_stop(EcbDriver.CLOCK_BOTTOM)
                 ecb.driver.clock_stop(EcbDriver.CLOCK_TOP)
-                ecb.driver.clock_blank(EcbDriver.CLOCK_BOTTOM)
-                ecb.driver.clock_blank(EcbDriver.CLOCK_TOP)
+
+            ecb.driver.clock_set(EcbDriver.CLOCK_BOTTOM,
+                                 ecb.game_config.time['min'], 0)
+            ecb.driver.clock_set(EcbDriver.CLOCK_TOP,
+                                 ecb.game_config.time['min'], 0)
 
             if ecb.game_config.level != GameConfig.LEVEL_DISABLED:
                 if ecb.engine is not None:
@@ -329,6 +332,9 @@ class Game(State):
     def _handle_game_started(self, ecb, event_data):
         if ecb.game_config.use_time_control():
             ecb.driver.clock_start(ecb.board.turn)
+        else:
+            ecb.driver.clock_blank(not ecb.board.turn)
+            ecb.driver.clock_set(ecb.board.turn, 0, 0)
 
         self.pondermove = None
         if ecb.board.turn == ecb.game_config.opp_color and\
@@ -376,6 +382,8 @@ class Game(State):
         if ecb.game_config.use_time_control():
             ecb.driver.clock_stop(ecb.board.turn)
             ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+        else:
+            ecb.driver.clock_blank(ecb.board.turn)
 
         ecb.board.push(move)
 
@@ -411,6 +419,8 @@ class Game(State):
 
         if ecb.game_config.use_time_control():
             ecb.driver.clock_start(ecb.board.turn)
+        else:
+            ecb.driver.clock_set(ecb.board.turn, 0, 0)
 
         invalid_squares_list = ecb.validate_board()
         if (len(invalid_squares_list)):
@@ -606,6 +616,8 @@ class EngineMove(State):
         if ecb.game_config.use_time_control():
             ecb.driver.clock_stop(ecb.board.turn)
             ecb.time[ecb.board.turn] = ecb.driver.clock_get(ecb.board.turn)
+        else:
+            ecb.driver.clock_blank(ecb.board.turn)
 
         ecb.board.push(bestmove)
 
@@ -623,6 +635,8 @@ class EngineMove(State):
 
         if ecb.game_config.use_time_control():
             ecb.driver.clock_start(ecb.board.turn)
+        else:
+            ecb.driver.clock_set(ecb.board.turn, 0, 0)
 
     def _handle_sensors_changed(self, ecb, event_data):
         if len(event_data) != 1:
@@ -919,9 +933,6 @@ class GameConfig(object):
         driver.clock_set(EcbDriver.CLOCK_TOP, self.time['min'], 0)
 
         if self.time['min'] == 0:
-            driver.clock_blank(EcbDriver.CLOCK_BOTTOM)
-            driver.clock_blank(EcbDriver.CLOCK_TOP)
-
             self.time_controlled = False
 
             return
