@@ -436,6 +436,10 @@ class Game(State):
     def _handle_engine_move_ended(self, ecb):
         if ecb.board.is_game_over():
             ecb.event_queue.put((Event.game_over, None))
+        else:
+            invalid_squares = ecb.validate_board()
+            if (len(invalid_squares)):
+                ecb.event_queue.put((Event.invalid_squares, invalid_squares))
 
     def _handle_pondering_finished(self, ecb, event_data):
         if ecb.game_config.level != GameConfig.LEVEL_DISABLED:
@@ -654,9 +658,6 @@ class EngineMove(State):
                 ecb.game_config.update_leds(ecb.driver)
 
             ecb.event_queue.put((Event.engine_move_ended, None))
-            invalid_squares = ecb.validate_board()
-            if (len(invalid_squares)):
-                ecb.event_queue.put((Event.invalid_squares, event_data))
 
     def run(self, ecb, event, event_data):
         print("EngineMove: " + str(event))
