@@ -1,6 +1,5 @@
-***************************************************
+
 # Foldable, Intel Edison powered, chess board project
-***************************************************
 
 This is the host side part, that will run on Intel Edison.
 
@@ -14,14 +13,14 @@ This is the host side part, that will run on Intel Edison.
 ## Installation on Edison (assuming you do it in the home directory):
 ### * Create the Python environment first:
 
-`$ pip install virtualenv`
-`$ virtualenv --system-site-packages ecb`
-`$ source ecb/bin/activate`
-`$ pip install python-chess`
-`$ pip install futures`
-`$ pip install python-socketio`
-`$ pip install Flask`
-`$ deactivate`
+<pre><code>$ pip install virtualenv
+$ virtualenv --system-site-packages ecb
+$ source ecb/bin/activate
+$ pip install python-chess
+$ pip install futures
+$ pip install python-socketio
+$ pip install Flask
+$ deactivate</code></pre>
 
 ### * Create a new directory inside the ecb environment directory:
 
@@ -33,6 +32,6 @@ This is the host side part, that will run on Intel Edison.
 
 ### * Install the systemd service:
 
-`$ cp ecb/ecb/ecb.service /lib/systemd/system/`
-`$ systemctl enable ecb`
-`$ systemctl start ecb`
+<pre><code>$ cp ecb/ecb/ecb.service /lib/systemd/system/
+$ systemctl enable ecb
+$ systemctl start ecb</code></pre>
